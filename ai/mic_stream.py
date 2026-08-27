@@ -31,7 +31,7 @@ from ai.audio import (
     CaptureBuffer, Decimator, FrameAssembler, HighPass, RingPreroll, WakeDetector, rms,
 )
 from ai.mic_device import (
-    apply_i2s_route, free_i2s_device, refresh_devices, resolve_input_device,
+    apply_i2s_route, free_i2s_device, pa_lock, refresh_devices, resolve_input_device,
     resume_pulse_sources,
 )
 from config.voice import SAMPLE_RATE
@@ -104,6 +104,15 @@ class MicStream:
 
     def open(self) -> bool:
         """Resolve a mic and open the stream. False (with .error set) if it can't be opened."""
+        # Held across resolve AND open, not just the open: refresh_devices() re-initialises the
+        # PortAudio host API, and it runs on the OTHER thread — the dashboard's re-resolve button
+        # while the audio worker's stall watchdog is here, or the reverse. A re-init landing inside
+        # Pa_OpenStream surfaces as "Illegal combination of I/O devices" [-9993] on an input-only
+        # stream, which reads as a device fault and is not one. See pa_lock in ai/mic_device.py.
+        with pa_lock:
+            return self._open_locked()
+
+    def _open_locked(self) -> bool:
         import sounddevice as sd
 
         # Same sequence as VoiceAssistant.ensure_input_resolved() (both call ai/mic_device):
@@ -116,8 +125,12 @@ class MicStream:
         free_i2s_device()
         print("[mic] resolving input device…", flush=True)
         mic = resolve_input_device()
-        if not mic.is_i2s:
-            resume_pulse_sources()
+        # Hand pulse back every capture card EXCEPT the one we are about to open raw. `is_i2s` used
+        # to stand in for that test and is the wrong question: a USB mic resolves to hw:<n>,0, just
+        # as raw and just as exclusive, with is_i2s False — so pulse was handed card 3 back and had
+        # re-grabbed the BY-PM700 before this line's own InputStream could open it, failing every
+        # attempt with "Device unavailable" [-9985] while the probe moments earlier read it as live.
+        resume_pulse_sources(keep_card=mic.card)
         print(f"[mic] resolved device={mic.device} rate={mic.rate} ch={mic.channels} "
               f"kind={mic.kind} i2s={mic.is_i2s} — opening stream…", flush=True)
 
@@ -188,6 +201,10 @@ class MicStream:
 
     def reopen(self) -> bool:
         """Tear the stream down and open it again, after a stall. Keeps the worker running."""
+        with pa_lock:            # close -> refresh -> open is one atomic step; see open()
+            return self._reopen_locked()
+
+    def _reopen_locked(self) -> bool:
         self.reopens += 1
         print(f"[mic] reopening (attempt {self.reopens})", flush=True)
         self.reopening = True

@@ -45,15 +45,31 @@ class TestEnsureInputResolved(unittest.TestCase):
              patch("ai.voice_assistant.free_i2s_device",
                    side_effect=lambda: calls.append("free")), \
              patch("ai.voice_assistant.resume_pulse_source",
-                   side_effect=lambda: calls.append("resume")), \
+                   side_effect=lambda keep_card="": calls.append(f"resume:{keep_card}")), \
              patch("ai.voice_assistant.resolve_input_device",
                    side_effect=lambda: (calls.append("resolve"),
-                                        MicChoice(3, 48000, 2, 0, "int16", True))[1]):
+                                        MicChoice(3, 48000, 2, 0, "int16", True,
+                                                  "i2s", "APE"))[1]):
             va.ensure_input_resolved()
-        # route applied, card freed from pulse, THEN probed; i2s result => no resume
-        self.assertEqual(calls, ["route", "free", "resolve"])
+        # Route applied, cards freed from pulse, THEN probed — and the resume that follows must
+        # name the card being opened raw, so pulse cannot re-grab it out from under the open.
+        self.assertEqual(calls, ["route", "free", "resolve", "resume:APE"])
 
-    def test_ensure_input_resolved_resumes_pulse_when_not_i2s(self):
+    def test_ensure_input_resolved_keeps_pulse_off_a_raw_usb_card(self):
+        """The regression this replaced: a USB mic on hw:3,0 is is_i2s=False and every bit as
+        exclusive. Resuming its card before opening it handed pulse the device back, and every
+        open then failed with "Device unavailable" [-9985] on a mic that had just probed live."""
+        va = make_assistant()
+        with patch("ai.voice_assistant.apply_i2s_route"), \
+             patch("ai.voice_assistant.free_i2s_device"), \
+             patch("ai.voice_assistant.resume_pulse_source") as mock_resume, \
+             patch("ai.voice_assistant.resolve_input_device",
+                   return_value=MicChoice(25, 48000, 1, 0, "int16", False, "usb", "3")):
+            va.ensure_input_resolved()
+        mock_resume.assert_called_once_with(keep_card="3")
+
+    def test_ensure_input_resolved_resumes_everything_for_a_pulse_device(self):
+        """No card means a pulse-mediated PCM, which is not exclusive — hand every source back."""
         va = make_assistant()
         with patch("ai.voice_assistant.apply_i2s_route"), \
              patch("ai.voice_assistant.free_i2s_device"), \
@@ -61,7 +77,7 @@ class TestEnsureInputResolved(unittest.TestCase):
              patch("ai.voice_assistant.resolve_input_device",
                    return_value=MicChoice(None, 16000, 1, 0, "int16", False)):
             va.ensure_input_resolved()
-        mock_resume.assert_called_once()
+        mock_resume.assert_called_once_with(keep_card="")
 
 
 class TestStateMachine(unittest.TestCase):

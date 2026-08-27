@@ -199,6 +199,20 @@ curl -s localhost:8081/params | jq '{kind:.sess_mic_kind, watching:.sess_mic_hot
   selection fell through. The log says which, per device: `read as silent` and `rejected the probe`
   are different problems (check the wiring vs. check what is holding the card).
 
+**If the log selects a mic and then fails to open it,** read the PortAudio error code — the two you
+are likely to see mean different things and neither is a broken microphone:
+
+- `Device unavailable [PaErrorCode -9985]` — something else holds the raw ALSA device, and on this
+  build that is almost always pulseaudio. Kai suspends every capture source before probing and then
+  hands back every card *except* the one it is about to open (you will see `[mic] pulse stays
+  suspended on the capture card (hw:N)`); if that line names the wrong card, or is missing when the
+  chosen device is a `hw:` one, pulse re-grabs the mic in the gap. `pactl list short sources` shows
+  who owns what.
+- `Illegal combination of I/O devices [PaErrorCode -9993]` — despite the wording, not a device
+  problem at all. It is PortAudio being re-initialised (`refresh_devices()`) on one thread while
+  another is opening a stream. `pa_lock` in `ai/mic_device.py` serialises those, so seeing this
+  again means a new caller reached `sd._terminate()` without taking it.
+
 **3. Reboot the Jetson** (`POST /system/reboot`) is **off by default** and needs two deliberate
 steps to switch on — see `REBOOT_ENABLED` in `config/tracking.py`, which explains why. In short:
 this dashboard has **no authentication at all** (Flask binds `0.0.0.0`), so unlike every other

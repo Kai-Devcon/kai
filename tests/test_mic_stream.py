@@ -5,12 +5,14 @@ it is the whole fan-out (gate, resample, high-pass, wake, VAD, capture) with the
 rather than arriving from a callback.
 """
 
+import threading
 import unittest
 from unittest.mock import MagicMock, patch
 
 import numpy as np
 
 from ai.audio import FrameAssembler
+from ai.mic_device import MicChoice
 from ai.mic_stream import MicStream
 from config.wake import CAPTURE_QUEUE_BLOCKS
 
@@ -241,6 +243,82 @@ class TestReopenRescansDevices(unittest.TestCase):
              patch.object(MicStream, "open", return_value=True) as opened:
             self.assertTrue(self._mic().reopen())
         opened.assert_called_once()
+
+class TestPulseIsKeptOffTheCardBeingOpened(unittest.TestCase):
+    """open() must not hand the chosen mic's card back to pulse on its way to opening it.
+
+    pulse re-grabs a resumed card immediately on this build (no module-suspend-on-idle), so the
+    resume that used to run here for every non-I2S device took the USB mic away between the probe
+    that found it live and the open that needed it: "Device unavailable" [-9985], every attempt,
+    forever, on 2026-08-27. `is_i2s` was the wrong test - hw:3,0 is raw and exclusive either way.
+    """
+
+    def _open(self, choice):
+        sd = MagicMock()
+        with (
+            patch("ai.mic_stream.apply_i2s_route"),
+            patch("ai.mic_stream.free_i2s_device"),
+            patch("ai.mic_stream.resume_pulse_sources") as resume,
+            patch("ai.mic_stream.resolve_input_device", return_value=choice),
+            patch.dict("sys.modules", {"sounddevice": sd}),
+        ):
+            ok = MicStream().open()
+        return ok, resume, sd
+
+    def test_a_raw_usb_mic_keeps_its_own_card_suspended(self):
+        ok, resume, sd = self._open(MicChoice(25, 48000, 1, 0, "int16", False, "usb", "3"))
+        self.assertTrue(ok)
+        resume.assert_called_once_with(keep_card="3")
+        self.assertEqual(sd.InputStream.call_args.kwargs["device"], 25)
+
+    def test_a_raw_i2s_mic_keeps_its_own_card_suspended(self):
+        ok, resume, _ = self._open(MicChoice(6, 48000, 2, 0, "int16", True, "i2s", "APE"))
+        self.assertTrue(ok)
+        resume.assert_called_once_with(keep_card="APE")
+
+    def test_a_pulse_mediated_device_hands_every_card_back(self):
+        ok, resume, _ = self._open(MicChoice(None, 16000, 1, 0, "int16", False))
+        self.assertTrue(ok)
+        resume.assert_called_once_with(keep_card="")
+
+
+class TestPortAudioReinitCannotLandInsideAnOpen(unittest.TestCase):
+    """refresh_devices() and open() are on different threads and must never overlap.
+
+    The stall watchdog reopens from the audio worker while the dashboard's re-resolve button can be
+    opening from the HTTP thread. Terminating the PortAudio host API mid-Pa_OpenStream does not fail
+    cleanly: it surfaces as "Illegal combination of I/O devices" [-9993] - an error about duplex
+    device pairs, raised on a stream that has no output side - which is what sent the 2026-08-27
+    investigation looking for a hardware fault that was not there.
+    """
+
+    def test_another_thread_cannot_reinit_portaudio_while_open_runs(self):
+        import ai.mic_device as mic_device
+        blocked = {}
+
+        def resolve():
+            # What refresh_devices() would be doing, from where it would be doing it: another
+            # thread. Re-entrancy makes the owning thread the wrong place to ask.
+            def probe():
+                got = mic_device.pa_lock.acquire(blocking=False)
+                blocked["locked_out"] = not got
+                if got:
+                    mic_device.pa_lock.release()
+            t = threading.Thread(target=probe)
+            t.start()
+            t.join(5)
+            return MicChoice(None, 16000, 1, 0, "int16", False)
+
+        with (
+            patch("ai.mic_stream.apply_i2s_route"),
+            patch("ai.mic_stream.free_i2s_device"),
+            patch("ai.mic_stream.resume_pulse_sources"),
+            patch("ai.mic_stream.resolve_input_device", side_effect=resolve),
+            patch.dict("sys.modules", {"sounddevice": MagicMock()}),
+        ):
+            MicStream().open()
+        self.assertTrue(blocked["locked_out"],
+                        "open() must hold pa_lock across resolve and Pa_OpenStream")
 
 if __name__ == "__main__":
     unittest.main()

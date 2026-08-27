@@ -794,6 +794,110 @@ class TestPulseSuspendResumeSymmetry(unittest.TestCase):
         self.assertIs(resume_pulse_source, resume_pulse_sources)
 
 
+class TestPulseStaysOffTheCardWeOpenRaw(unittest.TestCase):
+    """The card we are about to capture raw must NOT be handed back to pulse before we open it.
+
+    This build runs no module-suspend-on-idle, so pulse holds every card it owns open permanently
+    and re-grabs a resumed one within milliseconds. Resuming between resolve and open is what made a
+    healthy BY-PM700 probe live at 48 kHz and then fail EVERY open with "Device unavailable"
+    [PaErrorCode -9985], forever, on 2026-08-27. `is_i2s` was standing in for "raw device" and is
+    the wrong question: a USB mic on hw:3,0 is exactly as exclusive with is_i2s False.
+    """
+
+    SHORT = '0\talsa_input.usb-mic\t\n1\talsa_output.x.monitor\t\n2\talsa_input.other\t\n'
+    # `pactl list sources` - one block per source, the one property we need out of each.
+    LONG = (
+        'Source #0\n\tName: alsa_input.usb-mic\n\tProperties:\n\t\talsa.card = "3"\n'
+        'Source #2\n\tName: alsa_input.other\n\tProperties:\n\t\talsa.card = "0"\n'
+    )
+
+    def setUp(self):
+        reset_module_state()
+
+    def _run(self, long_out=None):
+        long_out = self.LONG if long_out is None else long_out
+
+        def run(cmd, **kw):
+            if cmd[:3] == ["pactl", "list", "short"]:
+                return MagicMock(stdout=self.SHORT)
+            if cmd[:3] == ["pactl", "list", "sources"]:
+                return MagicMock(stdout=long_out)
+            return MagicMock(stdout="")
+        return patch("ai.mic_device.subprocess.run", side_effect=run)
+
+    def _resumed(self, mock):
+        return [c.args[0][2] for c in mock.call_args_list
+                if c.args[0][:2] == ["pactl", "suspend-source"] and c.args[0][3] == "0"]
+
+    def test_the_chosen_cards_source_is_not_resumed(self):
+        with (
+            patch("ai.mic_device.I2S_SUSPEND_PULSE", True),
+            patch("ai.mic_device.PULSE_SUSPEND_ALL_SOURCES", True),
+            self._run() as mock,
+        ):
+            free_i2s_device()
+            mock.reset_mock()
+            resume_pulse_sources(keep_card="3")
+            resumed = self._resumed(mock)
+        self.assertNotIn("alsa_input.usb-mic", resumed)   # hw:3 — the mic we are about to open
+        self.assertIn("alsa_input.other", resumed)        # hw:0 — nothing to do with our capture
+
+    def test_the_kept_source_is_resumed_by_a_later_unqualified_resume(self):
+        # Left in the tracked list rather than dropped, so the card is handed back the moment we
+        # stop needing it exclusively — otherwise the source stays muted for the life of the process.
+        with (
+            patch("ai.mic_device.I2S_SUSPEND_PULSE", True),
+            patch("ai.mic_device.PULSE_SUSPEND_ALL_SOURCES", True),
+            self._run() as mock,
+        ):
+            free_i2s_device()
+            resume_pulse_sources(keep_card="3")
+            mock.reset_mock()
+            resume_pulse_sources()
+            resumed = self._resumed(mock)
+        self.assertIn("alsa_input.usb-mic", resumed)
+
+    def test_an_unattributable_source_is_left_suspended(self):
+        # Cannot tell which card it is on and we are opening one raw: guessing wrong here costs a
+        # muted source somewhere else, guessing wrong the other way costs the microphone.
+        with (
+            patch("ai.mic_device.I2S_SUSPEND_PULSE", True),
+            patch("ai.mic_device.PULSE_SUSPEND_ALL_SOURCES", True),
+            self._run(long_out="") as mock,
+        ):
+            free_i2s_device()
+            mock.reset_mock()
+            resume_pulse_sources(keep_card="3")
+            resumed = self._resumed(mock)
+        self.assertEqual(resumed, [])
+
+    def test_no_card_resumes_everything(self):
+        from ai.mic_device import I2S_PULSE_SOURCE
+        # A pulse-mediated PCM ("default"/"pulse") is not exclusive, so there is nothing to protect.
+        with (
+            patch("ai.mic_device.I2S_SUSPEND_PULSE", True),
+            patch("ai.mic_device.PULSE_SUSPEND_ALL_SOURCES", True),
+            self._run() as mock,
+        ):
+            free_i2s_device()
+            mock.reset_mock()
+            resume_pulse_sources()
+            resumed = self._resumed(mock)
+        self.assertCountEqual(
+            resumed, [I2S_PULSE_SOURCE, "alsa_input.usb-mic", "alsa_input.other"])
+
+
+class TestAlsaCardOfDeviceName(unittest.TestCase):
+    def test_raw_devices_yield_their_card_and_plugins_yield_nothing(self):
+        from ai.mic_device import _alsa_card_of
+        self.assertEqual(_alsa_card_of("BY-PM700: USB Audio (hw:3,0)"), "3")
+        self.assertEqual(_alsa_card_of("NVIDIA Jetson Orin Nano APE: - (hw:2,1)"), "2")
+        # Named plugin PCMs are not raw and not exclusive — pulse may keep them.
+        self.assertEqual(_alsa_card_of("default"), "")
+        self.assertEqual(_alsa_card_of("pulse"), "")
+        self.assertEqual(_alsa_card_of(""), "")
+
+
 class TestRefreshDevices(unittest.TestCase):
     def setUp(self):
         reset_module_state()
