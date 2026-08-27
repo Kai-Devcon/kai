@@ -131,6 +131,7 @@ class VoiceAssistant:
         self._capture_channel  = 0
         self._capture_dtype    = "int16"
         self._capture_is_i2s   = False
+        self._capture_card     = ""   # ALSA card, set only when the resolved device is raw hw:
         self._device_resolved = False
         self._whisper_model = None
         self._scan_model = None        # tiny model, wake-phrase spotting only
@@ -237,8 +238,11 @@ class VoiceAssistant:
             apply_i2s_route()   # best-effort; no-op / graceful fallback when the APE card is absent
             free_i2s_device()   # release the card from pulse so the raw hw probe can open at 48 kHz
             choice = resolve_input_device()
-            if not choice.is_i2s:
-                resume_pulse_source()   # not using the raw device — don't leave pulse muted
+            # Every card back to pulse EXCEPT the one about to be opened raw — on a build with no
+            # module-suspend-on-idle, pulse re-grabs a resumed card immediately and the open then
+            # fails with "Device unavailable". A USB mic on hw:<n>,0 is as exclusive as the I2S one,
+            # which is why this asks for the card rather than for is_i2s. See resume_pulse_sources().
+            resume_pulse_source(keep_card=choice.card)
             with self._lock:
                 self._capture_device   = choice.device
                 self._capture_rate     = choice.rate
@@ -246,6 +250,7 @@ class VoiceAssistant:
                 self._capture_channel  = choice.take_channel
                 self._capture_dtype    = choice.dtype
                 self._capture_is_i2s   = choice.is_i2s
+                self._capture_card     = choice.card
                 self._device_resolved  = True
 
     def ensure_llm_warm(self) -> None:
@@ -368,9 +373,12 @@ class VoiceAssistant:
         with self._lock:
             device, capture_rate = self._capture_device, self._capture_rate
             channels, dtype = self._capture_channels, self._capture_dtype
-            is_i2s = self._capture_is_i2s
-        if is_i2s:
-            free_i2s_device()   # re-assert in case pulse re-grabbed the card since we resolved
+            is_i2s, card = self._capture_is_i2s, self._capture_card
+        if card:
+            # Re-assert for ANY raw hw device, not just the I2S one: pulse re-grabbing the card
+            # between resolve and open is exactly what this guards, and it does that to a USB card
+            # just as readily. `is_i2s` is left bound because the rest of the method still asks it.
+            free_i2s_device()
         try:
             stream = sd.InputStream(
                 samplerate=capture_rate, channels=channels, dtype=dtype,

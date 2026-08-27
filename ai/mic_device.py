@@ -59,6 +59,16 @@ from config.wake import MIXER_TIMEOUT_S
 # everything up to the subdevice comma / closing paren (structural, not a tunable).
 _HW_CARD_RE = re.compile(r"hw:([^,\)]+)")
 
+# Serialises everything that changes PortAudio's own structure — refresh_devices() (which terminates
+# and re-initialises the host API) and opening a stream. They run on different threads: the audio
+# worker's stall watchdog reopens, and the dashboard's /audio/reresolve button resolves, and until
+# this lock existed they could interleave. Tearing the host API down while another thread is inside
+# Pa_OpenStream does not fail cleanly — it surfaces as "Illegal combination of I/O devices"
+# [PaErrorCode -9993], an error about duplex devices on a stream that has no output side, which cost
+# a full investigation on 2026-08-27 before it was recognised as a torn re-init rather than a device
+# problem. Re-entrant because MicStream.reopen() holds it across refresh_devices() AND open().
+pa_lock = threading.RLock()
+
 # The resolved mic: which device index/rate to open, how many channels to capture, which channel
 # holds the real audio (the INMP441 puts it only in the left slot), the sample dtype, whether it's
 # the raw I2S device (which needs pulseaudio suspended before each open), and which bucket it came
@@ -68,9 +78,23 @@ _HW_CARD_RE = re.compile(r"hw:([^,\)]+)")
 # collapses "the USB mic the operator chose" and "whatever the system default turned out to be" into
 # one False. Now that USB is a deliberate choice rather than a fallback, the dashboard has to be able
 # to say which of the two Kai is actually on, so the bucket travels with the choice.
-MicChoice = namedtuple("MicChoice", "device rate channels take_channel dtype is_i2s kind")
-# is_i2s defaults False and kind "other" (keeps non-i2s call sites terse)
-MicChoice.__new__.__defaults__ = (False, "other")
+#
+# `card` is the ALSA card id ("3", "APE") when the chosen device is a RAW hw: entry, and "" when it
+# is a pulse-mediated one ("default", "pulse", or no device at all). It exists because is_i2s was
+# being used as a stand-in for "we are about to open a raw device, so pulse must stay off this
+# card", and that is not what is_i2s means: a USB mic resolves to hw:<n>,0 — just as raw, and just
+# as exclusive — with is_i2s False. Handing pulse the card back before opening it is what made a
+# perfectly healthy BY-PM700 fail every open with "Device unavailable" (2026-08-27).
+MicChoice = namedtuple("MicChoice", "device rate channels take_channel dtype is_i2s kind card")
+# is_i2s defaults False, kind "other", card "" (keeps non-i2s call sites terse)
+MicChoice.__new__.__defaults__ = (False, "other", "")
+
+
+def _alsa_card_of(name: str) -> str:
+    """The ALSA card id in a PortAudio device name ("BY-PM700: USB Audio (hw:3,0)" -> "3"), or ""
+    for the named plugin PCMs (default/pulse/sysdefault), which are not raw and not exclusive."""
+    m = _HW_CARD_RE.search(name or "")
+    return m.group(1) if m else ""
 
 def _classify_device(name: str) -> str:
     """Bucket an input device by its name: 'i2s' (the preferred INMP441/APE mic), 'usb' (the
@@ -419,6 +443,30 @@ def _pactl_source_names() -> list[str]:
     return names
 
 
+def _pactl_source_cards() -> dict[str, str]:
+    """Map each pulseaudio capture source to the ALSA card index it sits on. Empty if pactl/pulse is
+    unavailable, which the caller reads as "cannot attribute" and treats as the cautious answer.
+
+    Same linear walk over `pactl list sources` as _speaker_alsa_card() does over cards, and for the
+    same reason: one property out of each block, in a format that has been stable for a decade."""
+    try:
+        out = subprocess.run(["pactl", "list", "sources"], check=True, capture_output=True,
+                             text=True, timeout=MIXER_TIMEOUT_S).stdout
+    except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
+        return {}
+    cards: dict[str, str] = {}
+    name = ""
+    for line in out.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("Source #"):
+            name = ""
+        elif stripped.startswith("Name:"):
+            name = stripped.split(":", 1)[1].strip()
+        elif name and stripped.startswith("alsa.card ") and "=" in stripped:
+            cards[name] = stripped.split("=", 1)[1].strip().strip('"')
+    return cards
+
+
 # Every source free_i2s_device() actually suspended, so resume_pulse_sources() can hand back exactly
 # that set. Module-level for the same reason the stream is centralised: suspend and resume happen on
 # different calls, in different objects, and the only correct resume list is the one the suspend
@@ -450,21 +498,44 @@ def free_i2s_device() -> None:
                 _suspended_sources.append(src)
 
 
-def resume_pulse_sources() -> None:
-    """Hand the cards back to pulseaudio — used when we end up NOT capturing from the raw I2S device
-    (a USB mic or the system default), so the pulse-backed paths aren't left muted.
+def resume_pulse_sources(keep_card: str = "") -> None:
+    """Hand the cards back to pulseaudio after the probe, EXCEPT the one we are about to capture raw.
 
     Resumes everything free_i2s_device() suspended, not just I2S_PULSE_SOURCE. That asymmetry was
     invisible while USB was only ever a boot-time fallback onto a raw hw device — a suspended source
     does not stop a raw open, so nothing looked broken. It stops being invisible the moment a run is
     *meant* to end on the USB mic: PULSE_SUSPEND_ALL_SOURCES had muted that source too, and only the
     I2S one was ever given back, so pulse-mediated capture on the chosen mic stayed suspended for the
-    life of the process. Idempotent, so calling it on a path that suspended nothing is a no-op."""
+    life of the process. Idempotent, so calling it on a path that suspended nothing is a no-op.
+
+    `keep_card` is the ALSA card of the device the caller is about to open RAW, and it is the whole
+    reason this takes an argument. Resuming is not a courtesy to other software — on this build there
+    is no module-suspend-on-idle, so pulse holds every card it owns open permanently, and handing it
+    back a card means it re-grabs the hw device within milliseconds. Doing that between resolving the
+    USB mic and opening it is what made a healthy BY-PM700 probe live at 48 kHz and then fail EVERY
+    open with "Device unavailable" [PaErrorCode -9985], forever, on 2026-08-27. The card being opened
+    raw therefore stays suspended; every other one is handed back, so nothing else is left muted.
+
+    A source pulse cannot attribute to a card is left suspended whenever keep_card is set: guessing
+    wrong in that direction costs a muted source somewhere else, and guessing wrong in the other one
+    costs the microphone. When keep_card is "" (a pulse-mediated device, which is not exclusive)
+    everything is handed back unconditionally — the historical behavior."""
     if not I2S_SUSPEND_PULSE:
         return
+    source_cards = _pactl_source_cards() if keep_card else {}
+    kept: list[str] = []
     for src in _suspended_sources or [I2S_PULSE_SOURCE]:
+        if keep_card and source_cards.get(src, "") == keep_card:
+            kept.append(src)
+            continue
+        if keep_card and src not in source_cards:
+            kept.append(src)              # unattributable: cautious side, see docstring
+            continue
         _pactl_suspend(src, False)
-    _suspended_sources.clear()
+    _suspended_sources[:] = kept
+    if kept:
+        print(f"[mic] pulse stays suspended on the capture card (hw:{keep_card}): "
+              f"{', '.join(kept)} — it would re-grab the device before we can open it", flush=True)
 
 
 # The old name, kept because it is imported by ai/mic_stream.py, ai/voice_assistant.py and
@@ -491,8 +562,9 @@ def refresh_devices() -> bool:
     _speaker_card = None
     _speaker_card_logged.clear()
     try:
-        sd._terminate()
-        sd._initialize()
+        with pa_lock:                    # never concurrently with a stream open — see pa_lock
+            sd._terminate()
+            sd._initialize()
     except Exception as exc:
         # Best-effort like the rest of this module. A failure here means the device list is stale,
         # not that the mic is gone — the caller goes on to open whatever the old list still offers.
@@ -523,7 +595,8 @@ def resolve_input_device() -> MicChoice:
             if _probe_is_live(idx, rate, channels, take_channel, retries):
                 print(f"[mic] selected {kind} mic: device {idx} "
                       f"({devices[idx].get('name', '?')}) at {rate} Hz", flush=True)
-                return MicChoice(idx, rate, channels, take_channel, "int16", kind == "i2s", kind)
+                return MicChoice(idx, rate, channels, take_channel, "int16", kind == "i2s", kind,
+                                 _alsa_card_of(devices[idx].get("name", "")))
     print("[voice_assistant] WARNING: every candidate input device read as silent or refused every "
           "usable rate — falling back to system default mic (recordings may be empty)")
     return MicChoice(None, SAMPLE_RATE, CHANNELS, 0, "int16", False)

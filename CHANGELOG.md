@@ -69,6 +69,60 @@ the alternative had a name worth saying.
 
 ---
 
+## 2026-08-27 — Pulse was taking the USB mic back in the gap between finding it and opening it
+
+The BY-PM700 above was found correctly and then failed every single open. The log said so plainly
+and still read as a hardware fault:
+
+```
+[mic] selected usb mic: device 25 (BY-PM700: USB Audio (hw:3,0)) at 48000 Hz
+[mic] resolved device=25 rate=48000 ch=1 kind=usb i2s=False — opening stream…
+[mic] ERROR: could not open microphone: Error opening InputStream: Device unavailable [-9985]
+```
+
+Found live at 48 kHz by a probe that opened the device for real, then unavailable a few milliseconds
+later, forever, on a fourteen-attempt retry loop that never converged.
+
+The gap between those two lines is `resume_pulse_sources()`. It ran on every non-I2S resolve, and
+the entry above had just widened it to hand back *every* source rather than only the I2S one — which
+is correct for the case it was written for and wrong here. This build loads no
+`module-suspend-on-idle`, so pulseaudio holds every card it owns open permanently: handing card 3
+back means pulse re-grabs `hw:3,0` within milliseconds, and a raw ALSA device admits exactly one
+opener. Kai was giving the microphone away and then failing to open it, once per attempt.
+
+The mistake underneath is that `is_i2s` was being used to mean "we are about to open a raw device".
+It never meant that. A USB mic resolves to `hw:<n>,0` — just as raw, just as exclusive — with
+`is_i2s` False, and that was invisible for exactly as long as USB was a fallback nobody expected a
+run to end on. `MicChoice` now carries the ALSA `card` of the resolved device (empty for the
+pulse-mediated PCMs, which are not exclusive), and `resume_pulse_sources(keep_card=...)` hands back
+every card *except* the one about to be opened raw. Sources pulse cannot attribute to a card are
+left suspended, because guessing wrong in that direction costs a muted source somewhere else and
+guessing wrong in the other one costs the microphone. The kept source is retained in the tracked
+list, so the next unqualified resume still hands it back.
+
+**And the error that made this expensive to read.** Interleaved with the above, on the reopen path:
+
+```
+[mic] resolved device=25 … opening stream…
+[mic] reopening (attempt 1)
+[mic] ERROR: could not open microphone: Error opening InputStream:
+      Illegal combination of I/O devices [PaErrorCode -9993]
+```
+
+`paBadIODeviceCombination` is PortAudio's error for an input and an output device on different host
+APIs. It cannot honestly occur on an input-only stream, and it did not: the stall watchdog's
+`reopen()` called `refresh_devices()` — `Pa_Terminate` then `Pa_Initialize` — on the audio worker
+thread while the dashboard's re-resolve button was inside `Pa_OpenStream` on the HTTP thread. The
+host API being rebuilt underneath an open surfaces as that error, and it sends you looking for a
+duplex device problem on a stream that has no output side. `ai/mic_device.pa_lock` now serialises
+the two: `MicStream.open()` holds it across resolve *and* open, `reopen()` holds it across
+close → refresh → open, and `refresh_devices()` takes it around the terminate/init pair.
+
+Verified on the robot: `sess_mic_live: true`, `sess_mic_kind: "usb"`, one watchdog reopen at
+startup and none since.
+
+---
+
 ## 2026-08-12 — The Bisaya filler was Cebu Bisaya, in a room full of Bukidnon and Iligan
 
 Read for dialect rather than for code. The `ceb` bank in `config/filler.py` is understandable
