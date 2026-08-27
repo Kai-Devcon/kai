@@ -20,6 +20,55 @@ Conventions:
 
 ---
 
+## 2026-08-27 — A USB mic is now a microphone Kai has, not one he settles for
+
+Kai could always fall back to a USB mic when the INMP441 read silent, but only as a fallback, only
+at startup, and — on the most common hardware — not at all. Three separate problems, and the first
+one is the reason this was worth doing rather than tuning:
+
+- **The guard against capturing the speaker's card was also throwing away real microphones.**
+  Capturing raw on the C-Media dongle while `tts.play()` reconfigures it segfaulted the process at
+  the startup greeting (2026-08-11), so input devices matching `"usb audio device"` are dropped. The
+  match is on the PortAudio *name* — and `"USB Audio Device"` is the most common name a cheap USB
+  mic enumerates under. A perfectly good mic was being discarded before it was ever probed, with no
+  log line saying a microphone had been rejected. The card is now identified by resolving
+  `TTS_CARD` to its ALSA card index through `pactl list cards` and matching that against the
+  `hw:<N>` in the device name. That is exact: two devices that share a product name are still on
+  different cards. Where `pactl` cannot answer — no pulse, a dev box — the name rule still applies,
+  because the failure it prevents is a segfault and the failure it causes is one skipped candidate.
+- **A mic plugged into a running Kai did nothing, and not for want of a retry path.**
+  `/audio/reresolve` already re-ran the whole discovery sequence on demand — against a device list
+  PortAudio snapshots at `Pa_Initialize` and never refreshes. The new card was invisible to it, so
+  the button could do everything right and still find nothing. `refresh_devices()` forces the
+  re-scan, from the only two places where no stream is open: inside `MicStream.reopen()`, and before
+  `start()` on the never-started path. `ai/mic_hotplug.py` watches `/proc/asound/cards` — the
+  kernel's list, not PortAudio's — and the session re-resolves at its next quiet moment. Never
+  mid-turn: a swap that cut someone off mid-sentence would be worse than waiting one turn. A change
+  must be seen on two separate polls and hold for 2 s, because USB enumeration is not atomic and the
+  card appears before its PCM devices are openable — probing early reads the new mic as silent,
+  which skips it, which is precisely the outcome plugging it in was meant to produce.
+- **Startup giving up was the one case hot-plug could not reach.** If all 14 start attempts fail
+  there is no tick loop, so nothing polls the watcher — and that is exactly the state a robot boots
+  into with no mic attached, i.e. the most likely moment for someone to plug one in.
+  `watch_for_a_mic()` keeps that already-finished startup thread watching instead.
+
+Also: `MIC_PREFERENCE` (`auto` / `i2s` / `usb`, live on the Microphone card) decides which kind is
+probed first. It **reorders and never excludes**, so preferring one mic cannot leave Kai deaf when
+only the other is plugged in. It is the one dashboard knob that does not apply instantly — a
+preference is only read while a mic is being resolved — which is why it sits next to the button that
+resolves one rather than in the Settings tab, where the footer promises everything is immediate.
+A USB mic now also gets one silent-read retry of its own (`USB_PROBE_SILENT_RETRIES`) and its own
+channel treatment, instead of inheriting `I2S_TAKE_CHANNEL`, which was harmless only because it
+happens to be 0. And `resume_pulse_sources()` now hands back every source `free_i2s_device()`
+suspended rather than just the I2S one — invisible while USB was only ever a raw-device fallback,
+and wrong the moment a run is *meant* to end on the USB mic.
+
+`sess_mic_kind`, `sess_mic_hotswaps` and `sess_mic_hotplug_watching` are on `/params`, and
+`/audio/reresolve` now returns `kind`, because "not the I2S mic" stopped being an honest label once
+the alternative had a name worth saying.
+
+---
+
 ## 2026-08-12 — The Bisaya filler was Cebu Bisaya, in a room full of Bukidnon and Iligan
 
 Read for dialect rather than for code. The `ceb` bank in `config/filler.py` is understandable

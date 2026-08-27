@@ -6,7 +6,7 @@ rather than arriving from a callback.
 """
 
 import unittest
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import numpy as np
 
@@ -198,6 +198,49 @@ class TestMicStreamFanOut(unittest.TestCase):
         audio, _ = mic.harvest_utterance()
         self.assertGreater(audio.size, 0, "speech before the VAD confirmed onset must survive")
 
+
+class TestReopenRescansDevices(unittest.TestCase):
+    """reopen() is the one place in the process where PortAudio's device list can be refreshed.
+
+    PortAudio snapshots that list at Pa_Initialize and never updates it, so a card plugged in after
+    startup is invisible for the life of the process — which is why the dashboard's "find the
+    microphone again" button could re-run the entire discovery path and still not find new hardware.
+    Refreshing means tearing the host API down and building it again, which invalidates open streams,
+    so the only safe window is between closing the old one and opening the new one.
+    """
+
+    def _mic(self):
+        mic = MicStream()
+        mic._stream = object()
+        return mic
+
+    def test_the_device_list_is_refreshed_before_the_new_stream_is_opened(self):
+        calls = []
+        with patch("ai.mic_stream.refresh_devices", side_effect=lambda: calls.append("refresh")), \
+             patch.object(MicStream, "_close_stream",
+                          side_effect=lambda: calls.append("close")) as _c, \
+             patch.object(MicStream, "open", side_effect=lambda: calls.append("open") or True):
+            self._mic().reopen()
+        self.assertEqual(calls, ["close", "refresh", "open"])
+
+    def test_no_stream_is_open_while_the_rescan_runs(self):
+        # The invariant that makes the rescan safe. Asserted on the object rather than on call
+        # order, because "close was called first" and "nothing is open" are not the same claim.
+        seen = {}
+        mic = self._mic()
+        with patch("ai.mic_stream.refresh_devices",
+                   side_effect=lambda: seen.update(stream=mic._stream)), \
+             patch.object(MicStream, "open", return_value=True):
+            mic.reopen()
+        self.assertIsNone(seen["stream"])
+
+    def test_a_failed_rescan_does_not_stop_the_reopen(self):
+        # A stale device list means the newly plugged mic may still be invisible, not that recovery
+        # should be abandoned — whatever the old list still offers is better than no stream.
+        with patch("ai.mic_stream.refresh_devices", return_value=False), \
+             patch.object(MicStream, "open", return_value=True) as opened:
+            self.assertTrue(self._mic().reopen())
+        opened.assert_called_once()
 
 if __name__ == "__main__":
     unittest.main()

@@ -79,8 +79,8 @@ def main() -> int:
     mic = resolve_input_device()
     if not mic.is_i2s:
         resume_pulse_source()
-    print(f"[wake_test] mic: device={mic.device} rate={mic.rate} channels={mic.channels} "
-          f"take_channel={mic.take_channel} i2s={mic.is_i2s}", flush=True)
+    print(f"[wake_test] mic: device={mic.device} kind={mic.kind} rate={mic.rate} "
+          f"channels={mic.channels} take_channel={mic.take_channel} i2s={mic.is_i2s}", flush=True)
     if mic.device is None:
         print("[wake_test] WARNING: fell back to the system default mic — the INMP441 was not "
               "found or read silent. Check the APE card and the I2S route.", flush=True)

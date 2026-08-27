@@ -823,12 +823,27 @@ function CameraStatusCard({ data }) {
    real audio every time — but until this existed the only way to take that second look was
    restarting the whole process. One tap, no confirmation: it costs a couple of seconds, keeps the
    camera and the conversation up, and the worst case is that it changes nothing. */
+const MIC_NAMES = { i2s: 'the built-in I2S mic', usb: 'the USB mic', other: 'the system default mic' };
+
 function MicRecoveryCard({ data }) {
   const [phase, setPhase] = useState('idle');   /* idle | sending | done | error */
   const [msg, setMsg] = useState('');
+  const [pref, setPref] = useState(null);       /* in-flight edit; null = follow the stream */
   const timer = useRef(null);
 
   useEffect(() => () => clearTimeout(timer.current), []);
+
+  /* The one setting that does NOT apply the instant it changes, which is why it lives here and not
+     in SETTINGS — everything in that panel does, and the panel says so at the bottom. A preference
+     is only consulted while a mic is being resolved, so it lands on the very next re-resolve: the
+     button directly below, a hot-plug, or a restart. Putting the two together makes that one
+     gesture instead of a rule to remember. */
+  function choose(value) {
+    setPref(value);
+    fetch('/settings', { method: 'POST', headers: { 'content-type': 'application/json' },
+                         body: JSON.stringify({ mic_preference: value }) })
+      .catch(() => setPref(null));
+  }
 
   function reresolve() {
     clearTimeout(timer.current);
@@ -839,9 +854,11 @@ function MicRecoveryCard({ data }) {
       .then(b => {
         if (b && b.ok) {
           /* Which mic it landed on is the whole point of the reply: "it worked" is not useful if
-             Kai is still on the fallback dongle when it should be on the I2S mic. */
+             Kai is on a different mic than the one you meant. Named rather than "I2S or not",
+             because "the fallback mic" stopped being an honest label once a USB mic became
+             something an operator chooses. */
           setPhase('done');
-          setMsg((b.is_i2s ? 'Now on the I2S mic' : 'Now on the fallback mic')
+          setMsg('Now on ' + (MIC_NAMES[b.kind] || 'an unrecognised mic')
                  + ' (device ' + b.device + ', ' + Math.round(b.rate / 1000) + ' kHz)'
                  + (b.restarted_session ? ' — hands-free is back up.' : '.'));
         } else {
@@ -861,13 +878,40 @@ function MicRecoveryCard({ data }) {
   /* sess_mic_live false is the symptom this button is for, so say so rather than making the
      operator infer it from a telemetry card further up the page. */
   const deaf = data.sess_mic_live === false;
+  const current = pref !== null ? pref : (data.set_mic_preference || 'auto');
+  const onMic = data.sess_mic_kind;
 
   return h('div', { className: 'card2', style: { padding: '12px 15px' } },
     h('div', { style: { fontSize: 11, fontWeight: 800, letterSpacing: '.12em', textTransform: 'uppercase',
       color: C.mute, marginBottom: 6 } }, 'Microphone'),
+    /* Which mic Kai is on right now, stated before anything is offered to change it. Without this
+       the panel asks for a preference while giving no way to tell whether it was honoured. */
+    onMic && !deaf ? h('div', { style: { fontSize: 12, color: C.text, marginBottom: 8 } },
+      'Listening on ' + (MIC_NAMES[onMic] || onMic) + '.') : null,
+    h('label', { style: { fontSize: 12, color: C.dim, display: 'block', marginBottom: 4 } }, 'Prefer'),
+    h('select', { value: current, onChange: e => choose(e.target.value),
+      'aria-label': 'Preferred microphone',
+      style: { width: '100%', fontSize: 12, color: C.text, background: 'rgba(255,255,255,0.05)',
+        border: '1px solid rgba(255,255,255,0.12)', padding: '7px 8px', borderRadius: 8,
+        marginBottom: 8 } },
+      h('option', { value: 'auto' }, 'Auto — built-in mic, then USB'),
+      h('option', { value: 'i2s' }, 'The built-in I2S mic'),
+      h('option', { value: 'usb' }, 'A USB mic')),
+    /* Both halves matter: a preference only reorders, so saying "preferred" without saying "and the
+       other one is still used if this is not there" invites the reading that picking one turns the
+       other off. */
+    h('div', { style: { fontSize: 11, color: C.mute, marginBottom: 8 } },
+      'Which mic to try first. The other is still used if the preferred one is missing or silent. '
+      + 'Takes effect on the next look — press the button below to apply it now.'),
     h('div', { style: { fontSize: 12, color: C.dim, marginBottom: 8 } },
       'Looks for a working microphone again and reopens the audio stream. Try this before '
       + 'restarting — it takes a couple of seconds and nothing else is interrupted.'),
+    /* Plugging a USB mic in is picked up on its own; this says so, so nobody hunts for a button
+       they do not need. Absent when the watcher is off (no /proc/asound/cards), because then it
+       genuinely does need the button. */
+    data.sess_mic_hotplug_watching ? h('div', { style: { fontSize: 11, color: C.mute, marginBottom: 8 } },
+      'A mic plugged in or unplugged is picked up on its own, within a few seconds of a quiet '
+      + 'moment.') : null,
     deaf && phase === 'idle' ? h('div', { style: { fontSize: 11, color: '#fcd34d', marginBottom: 8 } },
       '⚠ No microphone is open right now — this is the button for that.') : null,
     phase === 'done' ? h('div', { style: { fontSize: 12, color: '#86efac', marginBottom: 8 } },

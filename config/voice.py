@@ -47,6 +47,28 @@ I2S_PROBE_RETRY_DELAY_S  = 0.4
 I2S_MIC_NAME_HINTS = ("APE", "tegra-dlink", "i2s")  # INMP441 enumerates on card "APE" / PCM "tegra-dlink-0"
 USB_MIC_NAME_HINTS = ("usb",)
 
+# Which kind of mic to probe FIRST: "auto" (i2s, then usb, then everything else — the historical
+# order), "i2s", or "usb".
+#
+# This REORDERS the probe, it never excludes a kind. Preferring "usb" still falls through to the
+# INMP441 when no USB mic is live, and vice versa. A preference that could leave Kai deaf would be a
+# worse control than no control: the whole point of resolve_input_device() is that it keeps looking
+# until something actually captures signal, and a filter would defeat that. Live-settable from the
+# dashboard (settings.py), so switching mics does not need a restart — and an unrecognised value
+# falls back to "auto" rather than raising, because this one is operator-writable.
+MIC_PREFERENCE = "auto"
+
+# How many EXTRA times to re-read a USB/other mic before believing it is silent. See
+# I2S_PROBE_SILENT_RETRIES above for the mechanism.
+#
+# Zero was right while USB was only ever the boot-time fallback: those devices have no warm-up, so
+# silence from them was a real answer and retrying only slowed startup. Hot-plug changes that. A USB
+# mic re-probed seconds after it was plugged in has genuinely not settled — the card appears in
+# /proc/asound/cards before its PCM devices are usable — and one mistimed read would send Kai back to
+# the I2S mic for the rest of the run. Kept to 1 rather than I2S's 3: this is settling, not the
+# documented boot race, and it is paid on every non-live candidate at startup.
+USB_PROBE_SILENT_RETRIES = 1
+
 # Input devices that must NEVER be captured, because they are the SPEAKER's card.
 #
 # On this build the C-Media dongle is both the only output sink (TTS_SINK below) and an input device
@@ -75,12 +97,59 @@ USB_MIC_NAME_HINTS = ("usb",)
 # for that run and the log says so — strictly better than a segfault at the greeting, and
 # /audio/reresolve retries the mic without a restart.
 #
-# Matched as case-insensitive substrings of the PortAudio device name, exactly like the two hint lists
-# above. Because it IS a name match, keep it specific: it names the speaker's card, not "any USB audio
-# thing" — a separate USB mic ("USB PnP Sound Device") is unaffected, and a build whose speaker is not
-# this dongle needs this list changed with it. Set to () to allow capturing from the speaker's card
-# again, i.e. the pre-2026-08-11 behaviour and the crash it carried.
+# HOW a device is recognised as the speaker's card, in two tiers.
+#
+# Tier 1 (preferred, SPEAKER_CARD_FROM_TTS_CARD below): resolve TTS_CARD — the pulse card name this
+# build already plays through — to its ALSA card index via `pactl list cards`, and match that against
+# the `hw:<card>` in the PortAudio device name. This is exact. It identifies the one card that is
+# genuinely dangerous to capture raw, and nothing else.
+#
+# Tier 2 (fallback, the hints below): case-insensitive substrings of the PortAudio device name, the
+# original rule. Used only when tier 1 cannot answer — no pactl, no pulse, a dev box, or a TTS_CARD
+# that pulse does not know. The order matters and is deliberate: when in doubt this must still BLOCK,
+# because the failure it prevents is a segfault mid-greeting and the failure it causes is one skipped
+# candidate.
+#
+# Tier 1 exists because tier 2 is too coarse now that a USB mic is a supported input rather than a
+# last resort. "USB Audio Device" is the most common name a cheap USB mic enumerates under, so the
+# hint that blocks the C-Media dongle also blocks a perfectly good separate mic — before it is ever
+# probed, with no log line saying a mic was rejected. Keyed on the card index instead, the two are
+# never confused: they are different cards even when they share a name.
+#
+# Keep the hints specific for the same reason as before — they name the speaker's card, not "any USB
+# audio thing" — and a build whose speaker is not this dongle needs them changed with it. Set to ()
+# AND SPEAKER_CARD_FROM_TTS_CARD False to allow capturing from the speaker's card again, i.e. the
+# pre-2026-08-11 behaviour and the crash it carried.
+SPEAKER_CARD_FROM_TTS_CARD = True
 SPEAKER_CARD_NAME_HINTS = ("usb audio device",)
+
+# ── Microphone hot-plug ─────────────────────────────────────────────────────────
+# Noticing that a USB mic was plugged in or pulled out, so switching mics does not need a restart.
+#
+# Consumed by ai/mic_hotplug.py (the watcher) and ai/session.py (which acts on it), but it lives here
+# with the rest of the "which mic" config rather than in wake.py: everything that decides WHICH
+# device Kai captures from should be readable in one place.
+#
+# WHY A FILE AND NOT PortAudio. The obvious implementation — poll sd.query_devices() and diff it —
+# cannot work. PortAudio snapshots the ALSA device list at Pa_Initialize and never refreshes it, so a
+# card plugged in after startup is invisible to query_devices() for the life of the process. (That is
+# also why /audio/reresolve could not find a newly plugged mic before this: it re-ran the whole
+# discovery path against a stale list. See refresh_devices() in ai/mic_device.py.) Re-initialising
+# PortAudio on every poll WOULD refresh it, and would also tear down the live InputStream several
+# times a minute. /proc/asound/cards is the kernel's own list, costs one small read, and touches no
+# audio state whatsoever.
+MIC_HOTPLUG_ENABLED    = True
+MIC_HOTPLUG_CARDS_PATH = "/proc/asound/cards"
+MIC_HOTPLUG_POLL_S     = 3.0
+# Act only once the card set has held steady this long. USB enumeration is not atomic — the card
+# appears in /proc/asound/cards before its PCM devices are openable — so re-resolving the instant the
+# file changes probes a device that is not ready yet and reads it as silent.
+MIC_HOTPLUG_SETTLE_S   = 2.0
+# Floor between two automatic re-resolves. A re-resolve costs a stream teardown, a PortAudio re-init
+# and up to several liveness probes, so a flapping cable (or a hub that re-enumerates under load)
+# must not be able to spend the whole session doing that. The operator's dashboard button is not
+# subject to this — a human pressing it means "now".
+MIC_HOTPLUG_COOLDOWN_S = 20.0
 
 # Rates to try for a NON-I2S mic, in order, before giving up on that device. The I2S mic is
 # clock-locked to I2S_CAPTURE_RATE below and ignores this list.

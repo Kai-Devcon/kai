@@ -71,7 +71,7 @@ Every subsystem prefixes its own lines, so `grep` on the tag is the fastest way 
 [camera] CSI camera (sensor 0)
 [camera] live camera acquired: csi
 [wake] engine: porcupine (frame, 512 samples) — skipped none
-[mic] open: device=5 48000 Hz x2 -> 16000 Hz
+[mic] open: device=5 (i2s) 48000 Hz x2 -> 16000 Hz
 [llm] gemma2:2b fully on GPU (2374 MB VRAM)
 [control] 14.9 Hz  face=True
 [face_track] pan=97° sent | 15fps | yaw=52 pitch=48 roll=1 mouth=12 leye=61 reye=60 dist=44 smile=3 emotion=neutral
@@ -87,7 +87,7 @@ Every subsystem prefixes its own lines, so `grep` on the tag is the fastest way 
 | `[control]` | The servo thread's real rate. Edge-triggered on face presence, plus a 30 s heartbeat. If this sags well below 15 Hz, something is holding the GIL |
 | `[camera]` | Acquire / release / probe failures, logged only when the reason changes |
 | `[session]` | State transitions and turn boundaries — the first place to look for a wake that did not land |
-| `[mic]` / `[wake]` | Which device and which wake tier actually won |
+| `[mic]` / `[wake]` | Which device and which wake tier actually won. Also why a candidate mic was rejected — `read as silent` and `rejected the probe` are different problems — and any hot-plug swap |
 | `[turn]` | The latency breakdown, one line per reply. This is how "Kai feels slow" gets attributed |
 | `[llm]` | Ollama placement and per-request timings. A partial GPU offload is called out here |
 
@@ -167,11 +167,37 @@ one case needing a second look was the one case it skipped.
 
 ```bash
 curl -X POST localhost:8081/audio/reresolve
-# {"ok":true,"device":5,"rate":48000,"is_i2s":true,"live":true,"restarted_session":false,...}
+# {"ok":true,"device":5,"rate":48000,"kind":"i2s","is_i2s":true,"live":true,...}
 ```
 
 The reply says *which* mic it landed on, because "it worked" is not the whole answer — Kai on the
-fallback dongle when it should be on the I2S mic is a different situation with a different next step.
+USB mic when he should be on the I2S mic is a different situation with a different next step.
+
+### Switching microphones
+
+Kai takes both the built-in INMP441 and a USB mic, and you rarely have to do anything: plugging one
+in or pulling one out is noticed within a few seconds and applied at the next quiet moment. A swap
+never interrupts a turn in progress — if you plug a mic in while Kai is listening or replying, the
+change waits for the turn to finish.
+
+To choose deliberately, set **Prefer** on the Microphone card (or `POST /settings` with
+`mic_preference` of `auto`, `i2s` or `usb`) and press *Find the microphone again*. Unlike every knob
+in the Settings panel, this one does not apply the instant it changes — a preference is only read
+while a mic is being resolved — which is why it sits next to the button that resolves one.
+
+It reorders, it does not restrict. Preferring the USB mic still falls back to the INMP441 when no
+USB mic is live, and vice versa. Two things to check when a swap does not go the way you expected:
+
+```bash
+curl -s localhost:8081/params | jq '{kind:.sess_mic_kind, watching:.sess_mic_hotplug_watching,
+                                     swaps:.sess_mic_hotswaps, live:.sess_mic_live}'
+```
+
+- `watching: false` means the hot-plug watcher is off — it could not read `/proc/asound/cards`, so
+  mics are only picked up at startup and by the button.
+- `kind` not matching your preference means the preferred mic read as silent or refused to open, and
+  selection fell through. The log says which, per device: `read as silent` and `rejected the probe`
+  are different problems (check the wiring vs. check what is holding the card).
 
 **3. Reboot the Jetson** (`POST /system/reboot`) is **off by default** and needs two deliberate
 steps to switch on — see `REBOOT_ENABLED` in `config/tracking.py`, which explains why. In short:

@@ -24,6 +24,7 @@ from config.filler import (
     FILLER_MAX_STALL_S, FILLER_MIN_GAP_S, FILLER_PLAYBACK_START_BUDGET_S,
 )
 from config.thinking import THINKING_SOUND_DELAY_S, THINKING_SOUND_TEXT
+from config.voice import MIC_HOTPLUG_COOLDOWN_S
 from config.wake import (
     GREETING_TEXT,
     MAX_UTTERANCE_S, MIN_UTTERANCE_S, SESSION_BUSY_MAX_S, SESSION_MAX_ERROR_STREAK,
@@ -56,6 +57,7 @@ class FakeMic:
         self.wake.tiers = {wake_engine: "ok"} if wake_ready else {}
         self.live = True
         self.reopening = False
+        self.kind = "i2s"          # concrete for the same reason as wake.kind: it lands on /params
         self.last_rms = 0.0
         self.muted_blocks = 0
         self.reopens = 0
@@ -264,6 +266,28 @@ def _lock_probing_recorder(session, held):
                                            "mb": 0.0, "error": ""})
 
 
+class FakeWatcher:
+    """Stands in for CardWatcher. `fire` is a one-shot: set it, and the next poll reports a change.
+
+    Every session test gets one of these, not a real watcher — partly so the fake clock stays in
+    charge, and partly because the real one reads /proc/asound/cards, which does not exist on a dev
+    box and would have every test in this module log itself disabled."""
+
+    def __init__(self, active=True):
+        self.active = active
+        self.fire = False
+        self.changes = 0
+        self.polls = []
+
+    def poll(self, now):
+        self.polls.append(now)
+        if not (self.active and self.fire):
+            return False
+        self.fire = False
+        self.changes += 1
+        return True
+
+
 class SessionCase(unittest.TestCase):
     """Every test drives session.tick(now) with a fake clock — no threads, no sleeping."""
 
@@ -310,7 +334,9 @@ class SessionCase(unittest.TestCase):
                            wake_engine="whisper" if wake_kind == "utterance" else "porcupine")
         self.voice = FakeVoice()
         self.presence = FakePresence(visible=visible, is_fresh=is_fresh)
-        s = ConversationSession(self.voice, presence=self.presence, mic=self.mic, enabled=enabled)
+        self.hotplug = FakeWatcher()
+        s = ConversationSession(self.voice, presence=self.presence, mic=self.mic, enabled=enabled,
+                                hotplug=self.hotplug)
         s._set_state(STATE_IDLE if (enabled and wake_ready) else STATE_DISABLED, T0)
         if canned:
             # The four core lines, warm. NOT the filler bank: _canned_lines() is core-only since the
@@ -2693,6 +2719,209 @@ class TestMicError(SessionCase):
         s._mic.error = None
         self.assertEqual(s.mic_error(), "")
 
+
+class TestMicHotPlug(SessionCase):
+    """Plugging a mic into a running robot, and when it is safe to act on that.
+
+    The watcher only reports that the set of sound cards changed; every decision below is the
+    session's, because it is the only thing that knows whether Kai is mid-conversation.
+    """
+
+    def test_a_settled_change_re_resolves_the_mic(self):
+        s = self.make()
+        with patch.object(s, "reresolve_mic", return_value={"ok": True, "kind": "usb",
+                                                            "device": 1}) as re:
+            self.hotplug.fire = True
+            s.tick(T0 + 1)
+        re.assert_called_once()
+        self.assertEqual(s.get_status()["sess_mic_hotswaps"], 1)
+
+    def test_nothing_happens_without_a_change(self):
+        s = self.make()
+        with patch.object(s, "reresolve_mic") as re:
+            for i in range(10):
+                s.tick(T0 + i)
+        re.assert_not_called()
+
+    def test_a_change_mid_turn_is_deferred_not_dropped(self):
+        # Re-resolving takes the mic away for seconds. Doing that during an utterance would drop the
+        # turn on the floor and the person talking would have no idea why — but discarding the
+        # change would mean the mic they just plugged in never gets picked up, because the watcher
+        # reports each change exactly once.
+        s = self.make()
+        at = self.wake(s, T0)
+        self.assertEqual(s.state, STATE_LISTEN_WAIT)
+        with patch.object(s, "reresolve_mic", return_value={"ok": True}) as re:
+            self.hotplug.fire = True
+            s.tick(at + 1)
+            re.assert_not_called()
+            s._end_session(at + 2, "test")              # back to idle
+            s.tick(at + 3)
+            re.assert_called_once()
+
+    def test_a_deaf_robot_is_the_best_moment_to_act(self):
+        # STATE_DISABLED is where a robot with no working mic sits, so it must count as quiet.
+        s = self.make(wake_ready=False)
+        self.assertEqual(s.state, STATE_DISABLED)
+        with patch.object(s, "reresolve_mic", return_value={"ok": True}) as re:
+            self.hotplug.fire = True
+            s.tick(T0 + 1)
+        re.assert_called_once()
+
+    def test_the_cooldown_suppresses_a_second_swap(self):
+        # Anti-flap: a cable with a bad contact must not be able to spend the session tearing the
+        # capture stream down.
+        s = self.make()
+        with patch.object(s, "reresolve_mic", return_value={"ok": True}) as re:
+            self.hotplug.fire = True
+            s.tick(T0 + 1)
+            self.hotplug.fire = True
+            s.tick(T0 + 2)
+            self.assertEqual(re.call_count, 1)
+            self.hotplug.fire = True
+            s.tick(T0 + 1 + MIC_HOTPLUG_COOLDOWN_S + 1)
+            self.assertEqual(re.call_count, 2)
+
+    def test_a_change_during_the_cooldown_is_honoured_when_it_expires(self):
+        # The pending flag survives the cooldown, so a real change inside one is delayed, not lost.
+        s = self.make()
+        with patch.object(s, "reresolve_mic", return_value={"ok": True}) as re:
+            self.hotplug.fire = True
+            s.tick(T0 + 1)
+            self.hotplug.fire = True                    # arrives mid-cooldown
+            s.tick(T0 + 2)
+            self.assertEqual(re.call_count, 1)
+            s.tick(T0 + 1 + MIC_HOTPLUG_COOLDOWN_S + 1)  # no new change, but one is still pending
+            self.assertEqual(re.call_count, 2)
+
+    def test_the_re_resolve_runs_outside_the_session_lock(self):
+        # It tears the stream down, re-scans PortAudio and runs liveness probes — seconds of
+        # blocking work, several hundred tick periods. The lock is an RLock, so doing it inside the
+        # tick's locked section would have been legal and would have starved the audio worker,
+        # which needs that same lock ~30 times a second for the VAD.
+        s = self.make()
+        held = {"free": False}
+
+        def check():
+            # The tick thread owns the RLock re-entrantly if it never released it, so asking for it
+            # again from HERE would succeed no matter what. Another thread failing to take it is the
+            # only honest test. Acquire and release both happen on that thread — an RLock can only
+            # be released by its owner.
+            import threading as _t
+
+            def grab():
+                if s._lock.acquire(timeout=0.5):
+                    held["free"] = True
+                    s._lock.release()
+
+            t = _t.Thread(target=grab)
+            t.start()
+            t.join()
+            return {"ok": True}
+
+        with patch.object(s, "reresolve_mic", side_effect=check):
+            self.hotplug.fire = True
+            s.tick(T0 + 1)
+        self.assertTrue(held["free"], "the session lock was still held during the re-resolve")
+
+    def test_a_failed_swap_is_reported_and_changes_no_state(self):
+        # The cards changed, we looked, nothing usable came back. Not a reason to end anything.
+        s = self.make()
+        with patch.object(s, "reresolve_mic",
+                          return_value={"ok": False, "error": "every device read as silent"}):
+            self.hotplug.fire = True
+            s.tick(T0 + 1)
+        self.assertEqual(s.state, STATE_IDLE)
+        self.assertEqual(s.get_status()["sess_mic_hotswaps"], 1)
+
+    def test_the_watcher_is_polled_with_the_ticks_clock(self):
+        # No time.monotonic() of its own — that is what lets these tests step it without sleeping.
+        s = self.make()
+        s.tick(T0 + 7)
+        self.assertEqual(self.hotplug.polls[-1], T0 + 7)
+
+    def test_status_reports_whether_hot_plug_is_being_watched(self):
+        # It disables itself where /proc/asound/cards does not exist, and an operator staring at a
+        # robot that will not notice a new mic needs to be able to see that.
+        s = self.make()
+        status = s.get_status()
+        self.assertIn("sess_mic_hotplug_watching", status)
+        self.assertIsInstance(status["sess_mic_hotplug_watching"], bool)
+        self.assertEqual(status["sess_mic_kind"], "i2s")
+
+class TestWatchingForAMicWhenStartupGaveUp(SessionCase):
+    """The case the tick loop cannot cover: start() failed, so there is no tick loop.
+
+    That is exactly the state a robot boots into when its mic is missing, which makes it the most
+    likely moment for someone to plug one in — so "hot-plug works everywhere except when Kai is
+    already deaf" would have been the wrong shape of feature.
+    """
+
+    def test_it_starts_the_session_when_a_mic_appears(self):
+        s = self.make()
+        stop = threading.Event()
+        with patch.object(s, "reresolve_mic", return_value={"ok": True}) as re:
+            self.hotplug.fire = True
+            self.assertTrue(s.watch_for_a_mic(stop))
+        re.assert_called_once()
+
+    def test_it_keeps_waiting_while_nothing_changes(self):
+        s = self.make()
+        stop = threading.Event()
+        with patch.object(s, "reresolve_mic") as re, \
+             patch.object(stop, "wait", side_effect=lambda t: stop.set()):
+            self.assertFalse(s.watch_for_a_mic(stop))
+        re.assert_not_called()
+
+    def test_it_keeps_waiting_when_the_mic_that_appeared_is_unusable(self):
+        # A card changed but nothing usable came back. Not a reason to stop watching — the next
+        # change might be the real mic.
+        s = self.make()
+        stop = threading.Event()
+        with patch.object(s, "reresolve_mic", return_value={"ok": False}) as re, \
+             patch.object(stop, "wait", side_effect=lambda t: stop.set()):
+            self.hotplug.fire = True
+            self.assertFalse(s.watch_for_a_mic(stop))
+        re.assert_called_once()
+
+    def test_it_returns_immediately_when_hot_plug_is_unavailable(self):
+        # No /proc/asound/cards — nothing to watch, so blocking a thread on it forever would be a
+        # thread that can never do anything.
+        s = self.make()
+        self.hotplug.active = False
+        with patch.object(s, "reresolve_mic") as re:
+            self.assertFalse(s.watch_for_a_mic(threading.Event()))
+        re.assert_not_called()
+
+    def test_stopping_ends_the_watch(self):
+        s = self.make()
+        stop = threading.Event()
+        stop.set()
+        self.assertFalse(s.watch_for_a_mic(stop))
+
+
+class TestReresolveRescansDevices(SessionCase):
+    def test_the_never_started_path_re_scans_portaudio_first(self):
+        # MicStream.reopen() does this for the running case. Nothing did it for this one, so the
+        # button most needed when Kai has no mic would have searched a device list snapshotted
+        # before the mic was plugged in.
+        s = self.make()
+        calls = []
+        with patch("ai.session.refresh_devices", side_effect=lambda: calls.append("refresh")), \
+             patch.object(s, "start", side_effect=lambda: calls.append("start") or True):
+            s.reresolve_mic()
+        self.assertEqual(calls, ["refresh", "start"])
+
+    def test_the_running_path_leaves_the_rescan_to_the_stream(self):
+        # reopen() owns the only window where it is safe — after the stream is closed. Doing it here
+        # too would be a second rescan against a stream that is still open.
+        s = self.make()
+        s._thread = MagicMock()
+        s._thread.is_alive.return_value = True
+        with patch("ai.session.refresh_devices") as refresh:
+            s.reresolve_mic()
+        refresh.assert_not_called()
+        self.assertEqual(self.mic.reopens_requested, 1)
 
 if __name__ == "__main__":
     unittest.main()
