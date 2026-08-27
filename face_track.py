@@ -381,6 +381,13 @@ def run(args: argparse.Namespace) -> None:
                   "per-turn push-to-talk recording", flush=True)
             _voice.attach_mic(None)          # let the legacy per-turn path open its own stream
             threading.Thread(target=_voice.ensure_input_resolved, daemon=True).start()
+            # Then keep watching. The retries above cover startup contention — something else still
+            # holding the single-opener device — but not "there is no microphone attached", and that
+            # is the state someone is most likely to fix by plugging one in. The tick loop's
+            # hot-plug check cannot help here: start() never succeeded, so there is no tick loop.
+            # This thread has finished its work either way, so watching costs nothing new, and
+            # start() re-attaches the shared stream to the assistant if a mic does turn up.
+            _session.watch_for_a_mic(stop_evt)
 
         threading.Thread(target=_start_session, daemon=True, name="kai-session-start").start()
     else:

@@ -25,16 +25,35 @@ Kai runs with **none** of these attached — "no camera" is a reported state, no
 
 | Component | Notes |
 |-----------|-------|
-| INMP441 I2S MEMS microphone | The default mic. Captured raw on ALSA card `APE` at 48 kHz with PulseAudio suspended — see `config/voice.py` |
+| INMP441 I2S MEMS microphone | The built-in mic. Captured raw on ALSA card `APE` at 48 kHz with PulseAudio suspended — see `config/voice.py` |
 | USB audio dongle (C-Media) | Output DAC. Named as a PulseAudio sink in `TTS_SINK`, and its card profile is asserted on every start because Pulse flips it to S/PDIF unprompted |
 | PAM8403 amplifier + speaker | Driven from the dongle's analog jack |
-| USB microphone *(optional)* | Automatic fallback when the I2S mic reads silent or refuses to open |
+| USB microphone *(optional)* | A supported input, not just a fallback. Plug one in and Kai switches to it within seconds; unplug it and he goes back to the I2S mic |
 
-> **The I2S wiring is not recorded in this repo.** `config/voice.py` documents the *software* side
-> in detail — the XBAR/I2S2 route applied by `apply_i2s_route()`, the 48 kHz clock, stereo capture
-> with real audio only in the left slot — but the physical pinout to the 40-pin header lived in a
-> `mictest/RESULTS.md` that is not committed here. Recover it from the running robot before
-> rewiring.
+### Which microphone Kai uses
+
+Both mics are probed on every resolve and the first one that captures real signal wins.
+`MIC_PREFERENCE` (`config/voice.py`, live-settable on the dashboard) decides which kind is tried
+first — `auto`, `i2s` or `usb`. It only reorders: preferring the USB mic still falls through to the
+INMP441 when no USB mic is live, so the setting can never leave Kai deaf.
+
+Plugging a mic in or pulling one out is noticed on its own. `ai/mic_hotplug.py` watches
+`/proc/asound/cards` and, once the card set has settled, the session re-resolves at its next quiet
+moment — never mid-turn, so a swap cannot cut someone off mid-sentence. On a machine without that
+file the watcher turns itself off and the dashboard button is the way to re-resolve.
+
+> **The USB mic and the speaker dongle can share a name.** Capturing on the speaker's own card
+> segfaulted the process at the startup greeting (2026-08-11) and is blocked, but the block used to
+> be a name-substring match on `"usb audio device"` — which is also what a cheap USB mic typically
+> enumerates as. The card is now identified by resolving `TTS_CARD` to its ALSA card index via
+> `pactl`, so the two are never confused. Where `pactl` cannot answer, the name rule still applies
+> and a USB mic with that name will be skipped.
+
+> **The I2S wiring** is in §4 of `docs/buildsheet/Kai_Build_Sheet_hardware_revE.docx` — the INMP441
+> to 40-pin header mapping, including the two that bite: VDD on **Pin 1 (3.3 V, not 5 V)** and L/R
+> tied to **Pin 9 (GND)**, which is what puts the audio in the left slot. `config/voice.py`
+> documents the software side: the XBAR/I2S2 route applied by `apply_i2s_route()`, the 48 kHz clock,
+> and stereo capture with real audio only in the left channel.
 
 ## Optional / not currently wired
 

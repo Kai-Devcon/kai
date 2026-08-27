@@ -31,7 +31,8 @@ from ai.audio import (
     CaptureBuffer, Decimator, FrameAssembler, HighPass, RingPreroll, WakeDetector, rms,
 )
 from ai.mic_device import (
-    apply_i2s_route, free_i2s_device, resolve_input_device, resume_pulse_source,
+    apply_i2s_route, free_i2s_device, refresh_devices, resolve_input_device,
+    resume_pulse_sources,
 )
 from config.voice import SAMPLE_RATE
 from config.wake import (
@@ -66,6 +67,7 @@ class MicStream:
         self._dtype = "int16"
         self._device = None
         self._is_i2s = False
+        self._kind = "other"
 
         self._decim: Decimator | None = None
         # Built once, not per open: it runs at the EMIT rate (always 16 kHz), so unlike the decimator
@@ -115,14 +117,15 @@ class MicStream:
         print("[mic] resolving input device…", flush=True)
         mic = resolve_input_device()
         if not mic.is_i2s:
-            resume_pulse_source()
+            resume_pulse_sources()
         print(f"[mic] resolved device={mic.device} rate={mic.rate} ch={mic.channels} "
-              f"i2s={mic.is_i2s} — opening stream…", flush=True)
+              f"kind={mic.kind} i2s={mic.is_i2s} — opening stream…", flush=True)
 
         with self._lock:
             self._device, self._capture_rate = mic.device, mic.rate
             self._channels, self._take_channel = mic.channels, mic.take_channel
             self._dtype, self._is_i2s = mic.dtype, mic.is_i2s
+            self._kind = mic.kind
             # Only the raw I2S device is rate-locked to 48 kHz. USB/default go through pulse's
             # plughw, which resamples for us — so ask for 16 kHz directly and skip the decimator,
             # which deletes the 44.1 kHz non-integer-ratio problem instead of solving it.
@@ -151,8 +154,9 @@ class MicStream:
             self._stream = stream
             self.error = None
         self.last_block_t = time.monotonic()
-        print(f"[mic] open: device={self._device} {self._capture_rate} Hz x{self._channels} "
-              f"-> {SAMPLE_RATE} Hz{'' if self._decim else ' (no resample)'}", flush=True)
+        print(f"[mic] open: device={self._device} ({self._kind}) {self._capture_rate} Hz "
+              f"x{self._channels} -> {SAMPLE_RATE} Hz"
+              f"{'' if self._decim else ' (no resample)'}", flush=True)
         return True
 
     def start(self) -> bool:
@@ -194,6 +198,13 @@ class MicStream:
                     self._blocks.get_nowait()
                 except queue.Empty:
                     break
+            # The only safe window for this in the whole process: PortAudio's device list is a
+            # snapshot taken at Pa_Initialize, and refreshing it means tearing the host API down and
+            # building it again — which invalidates open streams. Ours is closed, right here, and
+            # nowhere else. Without it a re-resolve re-runs the entire discovery path against a list
+            # that predates the mic being plugged in, which is why the dashboard button could not
+            # find new hardware and why hot-plug would not have worked either.
+            refresh_devices()
             ok = self.open()
             if ok:
                 self.reset_dsp()
@@ -455,3 +466,11 @@ class MicStream:
     def is_i2s(self) -> bool:
         with self._lock:
             return self._is_i2s
+
+    # Which mic this is — "i2s", "usb" or "other". Separate from is_i2s, which answers the narrower
+    # operational question "does this device need pulse suspended". The dashboard needs to name the
+    # mic now that USB is a choice rather than a fallback, and "not I2S" is not a name.
+    @property
+    def kind(self) -> str:
+        with self._lock:
+            return self._kind

@@ -34,6 +34,8 @@ import numpy as np
 from ai import filler, tts
 from ai.audio import SpeechGate
 from ai.audio_debug import UtteranceRecorder
+from ai.mic_device import refresh_devices
+from ai.mic_hotplug import CardWatcher
 from ai.mic_stream import MicStream
 from ai.voice_assistant import (
     STATUS_DONE, STATUS_ERROR, STATUS_IDLE, STATUS_RECORDING, STATUS_TRANSCRIBING,
@@ -46,7 +48,7 @@ from config.filler import (
     FILLER_PLAYBACK_START_BUDGET_S, FILLER_PREWARM, FILLER_STALL_GAP_JITTER_S,
 )
 from config.thinking import THINKING_SOUND_DELAY_S, THINKING_SOUND_TARGET_S, THINKING_SOUND_TEXT
-from config.voice import SAMPLE_RATE
+from config.voice import MIC_HOTPLUG_COOLDOWN_S, MIC_HOTPLUG_POLL_S, SAMPLE_RATE
 from config.wake import (
     ACK_PRESYNTH, ACK_WAV_DIR, CANNED_ERROR, CANNED_NO_SPEECH,
     DEBUG_CAPTURE_DIR, DEBUG_CAPTURE_ENABLED,
@@ -153,9 +155,12 @@ class ConversationSession:
 
     `presence` is a callable returning (visible, seconds_since_seen, is_fresh) — vision/presence.py's
     snapshot, injected so this class never imports the tracking stack and can be tested with a fake.
+    `hotplug` is a CardWatcher, injected for the same reason: the fake-clock tests step it through an
+    enumeration without touching /proc or sleeping.
     """
 
-    def __init__(self, assistant, presence=None, mic=None, enabled: bool | None = None) -> None:
+    def __init__(self, assistant, presence=None, mic=None, enabled: bool | None = None,
+                 hotplug=None) -> None:
         self._voice = assistant
         self._presence = presence
         self._lock = threading.RLock()
@@ -167,6 +172,13 @@ class ConversationSession:
             on_wake=self.on_wake, on_audio=self._on_audio, muted=self.mic_muted,
         )
         self._gate = SpeechGate(rate=SAMPLE_RATE)
+        # Mic hot-plug. The watcher only reports that the card set changed; every decision about
+        # whether it is a good moment to act on that lives in _tick, because this class is the only
+        # thing that knows whether Kai is mid-conversation.
+        self._hotplug = hotplug if hotplug is not None else CardWatcher()
+        self._hotplug_pending = False   # a change seen mid-turn, waiting for an idle tick
+        self._hotplug_last = 0.0        # when the last automatic re-resolve ran (cooldown)
+        self._hotswaps = 0
         self._canned: dict[str, object] = {}
         # The startup greeting is once per PROCESS, not once per start(). start() is re-entered by
         # reresolve_mic() whenever the operator retries a mic that failed to come up at boot — which
@@ -354,6 +366,13 @@ class ConversationSession:
             else:
                 print("[mic] re-resolve requested from the dashboard (session was not running)",
                       flush=True)
+                # MicStream.reopen() re-scans PortAudio for us on the branch above; nothing does on
+                # this one, because start() opens a stream rather than reopening one. Without this
+                # the never-started case — the case this button most exists for — would re-run the
+                # whole discovery path against the device list PortAudio snapshotted at startup, and
+                # a mic plugged in since then would still be invisible. Safe here by definition:
+                # the session is not running, so there is no stream to invalidate.
+                refresh_devices()
                 ok = self.start()
         except Exception as exc:                      # pragma: no cover - defensive
             return {"status": "error", "ok": False, "restarted_session": False,
@@ -366,11 +385,43 @@ class ConversationSession:
                 if self._state == STATE_DISABLED and self._wake_live():
                     self._set_state(STATE_IDLE, time.monotonic())
 
+        # `kind` names the mic; `is_i2s` is kept for the callers that only ever asked "raw device or
+        # not". The dashboard needs the name now that a USB mic is something an operator chooses
+        # rather than what Kai settles for — "not the I2S mic" was an adequate label only while the
+        # alternative had no name worth saying.
         return {"status": "ok" if ok else "error", "ok": bool(ok),
                 "restarted_session": not running and bool(ok),
                 "device": self._mic.device, "rate": self._mic.capture_rate,
-                "is_i2s": self._mic.is_i2s, "live": self._mic.live,
+                "kind": self._mic.kind, "is_i2s": self._mic.is_i2s, "live": self._mic.live,
                 "error": "" if ok else (self.mic_error() or "no reason reported")}
+
+    def watch_for_a_mic(self, stop) -> bool:
+        """Blocking. Keep looking for a microphone until one comes up or `stop` is set.
+
+        For the one case the tick loop cannot cover: start() failed every attempt, so there is no
+        tick thread, so nothing is polling the hot-plug watcher — and that is precisely the state a
+        robot boots into when its mic is missing, which makes it the single most likely moment for
+        someone to plug one in. Without this, "plug a mic into a running Kai" works in every
+        situation except the one where the robot is already deaf.
+
+        Driven by face_track's session-start thread once its retries are exhausted, so it costs a
+        thread that had finished its work rather than a new one. Returns True if a mic came up.
+        Never raises: reresolve_mic() cannot, and a watcher that cannot read its file simply
+        reports that hot-plug is unavailable and this returns.
+        """
+        if not self._hotplug.active:
+            print("[mic] no microphone, and hot-plug watching is unavailable — the dashboard's "
+                  "'find the microphone again' button is the way back", flush=True)
+            return False
+        print("[mic] no microphone; watching for one to be plugged in", flush=True)
+        while not stop.is_set():
+            if self._hotplug.poll(time.monotonic()) and self.reresolve_mic().get("ok"):
+                print(f"[mic] a microphone appeared — now on the {self._mic.kind} mic", flush=True)
+                return True
+            # Waits on the stop event rather than sleeping, so shutdown is immediate rather than up
+            # to a poll interval late.
+            stop.wait(MIC_HOTPLUG_POLL_S)
+        return False
 
     def mic_error(self) -> str:
         """Why the last mic open failed, or "" if it didn't. Public so the start-retry loop can put
@@ -1306,6 +1357,7 @@ class ConversationSession:
         already does with its own `pending`.
         """
         pending: tuple[str, str] | None = None
+        hotswap = False
         with self._lock:
             if self._presence is not None:
                 try:
@@ -1396,6 +1448,7 @@ class ConversationSession:
             if not self._mic.live and not self._mic.reopening and state != STATE_DISABLED:
                 self._end_session(now, "mic_lost")
 
+            hotswap = self._check_hotplug(now)
             self._heartbeat(now)
 
         # Outside the lock, by construction rather than by convention: both of these harvest audio,
@@ -1406,6 +1459,64 @@ class ConversationSession:
                 self._finish_utterance(now, reason=reason)
             else:
                 self._finish_scan(now, reason=reason)
+
+        # Out here for the same reason and a stronger one: a re-resolve tears the stream down,
+        # re-scans PortAudio and runs liveness probes, which is seconds of blocking work — several
+        # hundred tick periods — and the lock is an RLock, so doing it above would have been legal
+        # and would have starved the audio worker the whole time.
+        if hotswap:
+            self._run_hotswap(now)
+
+    def _check_hotplug(self, now: float) -> bool:
+        """Caller holds the lock. True if the tick should re-resolve the mic once it releases it.
+
+        The watcher reports a settled card change; this decides whether now is the moment. Two things
+        make it not the moment, and they are different:
+
+          * Kai is mid-turn. Re-resolving takes the microphone away for seconds, so doing it during a
+            wake check, an utterance or a reply would drop that turn on the floor — and the person
+            talking would have no idea why. The change is LATCHED rather than dropped: whoever
+            plugged the mic in still gets it, at the next quiet moment, which is at most one turn
+            away. (Latched, not re-polled: the watcher reports each change exactly once, so a
+            dropped report would never come back.)
+          * The cooldown has not elapsed. Anti-flap — see MIC_HOTPLUG_COOLDOWN_S. A cable with a bad
+            contact, or a hub re-enumerating under load, must not be able to spend the session
+            tearing the capture stream down. The pending flag survives the cooldown, so a real change
+            during one is honoured when it expires rather than being lost.
+
+        STATE_DISABLED counts as quiet on purpose: it is the state a robot with no working mic sits
+        in, so it is the single most valuable moment to act on someone plugging one in.
+        """
+        if self._hotplug.poll(now):
+            self._hotplug_pending = True
+        if not self._hotplug_pending:
+            return False
+        if self._state not in (STATE_IDLE, STATE_DISABLED):
+            return False
+        if self._hotplug_last and now - self._hotplug_last < MIC_HOTPLUG_COOLDOWN_S:
+            return False
+        self._hotplug_pending = False
+        self._hotplug_last = now
+        return True
+
+    def _run_hotswap(self, now: float) -> None:
+        """Caller does NOT hold the lock. Re-resolve after a card change, and say what happened.
+
+        Deliberately the same path as the dashboard button — reresolve_mic() — rather than a second
+        way to reopen the mic. It already handles both "the session is live" and "the session never
+        started", already re-derives sess_state out of STATE_DISABLED, and already cannot raise. The
+        only thing hot-plug adds is noticing; nothing about the recovery itself is new.
+        """
+        self._hotswaps += 1
+        result = self.reresolve_mic()
+        if result.get("ok"):
+            self._log(f"hot-plug: now on the {result.get('kind', '?')} mic "
+                      f"(device {result.get('device')})")
+        else:
+            # Not an error worth ending anything over: the cards changed, we looked, nothing usable
+            # came back. Says so once, and the next change (or the dashboard button) tries again.
+            self._log(f"hot-plug: no usable microphone after the card change "
+                      f"({result.get('error') or 'no reason reported'})")
 
     def _end_session(self, now: float, reason: str) -> None:
         """Caller holds the lock. Back to idle, with the conversation forgotten."""
@@ -1630,6 +1741,9 @@ class ConversationSession:
                 "sess_mic_muted": state in _SPEECH_STATES,
                 "sess_muted_blocks": self._mic.muted_blocks,
                 "sess_mic_live": self._mic.live,
+                "sess_mic_kind": self._mic.kind,
+                "sess_mic_hotswaps": self._hotswaps,
+                "sess_mic_hotplug_watching": self._hotplug.active,
                 "sess_mic_reopens": self._mic.reopens,
                 "sess_audio_overflows": self._mic.overflows,
                 "sess_blocks_dropped": self._mic.dropped_blocks,

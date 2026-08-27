@@ -17,6 +17,16 @@ The hard-won parts, all documented at their call sites and in config/voice.py:
     whole session down (2026-08-09).
   * A device that reads as silent and a device that refuses to open are different problems with
     different fixes, so both are logged, and only the former is retried.
+  * PortAudio snapshots the ALSA device list at Pa_Initialize and never refreshes it, so nothing here
+    can see a card plugged in after startup until refresh_devices() forces a re-scan — and that can
+    only be done with no stream open.
+
+A USB mic is a supported input and not merely the fallback the I2S mic degrades to: MIC_PREFERENCE
+picks which kind is probed first, _profile_for() gives each kind its own channel/retry treatment, and
+ai/mic_hotplug.py notices one being plugged in or pulled out so the switch does not need a restart.
+What is NOT symmetric between them is the speaker: exactly one card must never be captured raw, and
+_is_speaker_card() identifies it by ALSA card index rather than by name so that a USB mic sharing the
+speaker dongle's product name is still usable.
 
 Best-effort throughout: a missing amixer, a missing pactl or an absent APE card logs and falls back
 to the USB/system-default mic rather than raising into startup.
@@ -33,12 +43,14 @@ from collections import namedtuple
 import numpy as np
 import sounddevice as sd
 
+import settings
 from config.voice import (
     CHANNELS, FALLBACK_CAPTURE_RATES, I2S_APPLY_ROUTE_ON_STARTUP, I2S_CAPTURE_CHANNELS,
     I2S_CAPTURE_RATE, I2S_MIC_NAME_HINTS, I2S_PROBE_RETRY_DELAY_S, I2S_PROBE_SILENT_RETRIES,
     I2S_PULSE_SOURCE, I2S_ROUTE_CARD, I2S_ROUTE_CONTROLS, I2S_SUSPEND_PULSE, I2S_TAKE_CHANNEL,
-    LIVE_PROBE_DURATION_S, LIVE_PROBE_RMS_THRESHOLD, LIVE_PROBE_TIMEOUT_S,
-    PULSE_SUSPEND_ALL_SOURCES, SAMPLE_RATE, SPEAKER_CARD_NAME_HINTS, USB_MIC_NAME_HINTS,
+    LIVE_PROBE_DURATION_S, LIVE_PROBE_RMS_THRESHOLD, LIVE_PROBE_TIMEOUT_S, MIC_PREFERENCE,
+    PULSE_SUSPEND_ALL_SOURCES, SAMPLE_RATE, SPEAKER_CARD_FROM_TTS_CARD, SPEAKER_CARD_NAME_HINTS,
+    TTS_CARD, USB_MIC_NAME_HINTS, USB_PROBE_SILENT_RETRIES,
 )
 from config.wake import MIXER_TIMEOUT_S
 
@@ -48,10 +60,17 @@ from config.wake import MIXER_TIMEOUT_S
 _HW_CARD_RE = re.compile(r"hw:([^,\)]+)")
 
 # The resolved mic: which device index/rate to open, how many channels to capture, which channel
-# holds the real audio (the INMP441 puts it only in the left slot), the sample dtype, and whether
-# it's the raw I2S device (which needs pulseaudio suspended before each open).
-MicChoice = namedtuple("MicChoice", "device rate channels take_channel dtype is_i2s")
-MicChoice.__new__.__defaults__ = (False,)   # is_i2s defaults False (keeps non-i2s call sites terse)
+# holds the real audio (the INMP441 puts it only in the left slot), the sample dtype, whether it's
+# the raw I2S device (which needs pulseaudio suspended before each open), and which bucket it came
+# from.
+#
+# `kind` is not derivable from is_i2s — that flag answers "does this need pulse suspended", and it
+# collapses "the USB mic the operator chose" and "whatever the system default turned out to be" into
+# one False. Now that USB is a deliberate choice rather than a fallback, the dashboard has to be able
+# to say which of the two Kai is actually on, so the bucket travels with the choice.
+MicChoice = namedtuple("MicChoice", "device rate channels take_channel dtype is_i2s kind")
+# is_i2s defaults False and kind "other" (keeps non-i2s call sites terse)
+MicChoice.__new__.__defaults__ = (False, "other")
 
 def _classify_device(name: str) -> str:
     """Bucket an input device by its name: 'i2s' (the preferred INMP441/APE mic), 'usb' (the
@@ -64,13 +83,89 @@ def _classify_device(name: str) -> str:
     return "other"
 
 
+def _preference() -> str:
+    """Which kind to probe first: "i2s", "usb", or "auto". Live-settable from the dashboard.
+
+    PULL-read (settings.py's term) rather than pushed, because it is only consulted on the resolve
+    path — startup, the dashboard button, a hot-plug — never on the 20 ms audio path. Falls back to
+    the config default if settings is unreadable for any reason, and an unrecognised value reads as
+    "auto": this is operator-writable, and a typo must not be able to change which mic Kai picks in a
+    way nobody can explain.
+    """
+    try:
+        pref = settings.get("mic_preference")
+    except Exception:
+        pref = MIC_PREFERENCE
+    return pref if pref in ("i2s", "usb", "auto") else "auto"
+
+
+# The speaker's ALSA card index, resolved from TTS_CARD via pactl. Three states, and they are
+# different: an index string means "resolved, block this card"; "" means "asked pactl, it could not
+# tell us" (tier 2 takes over); None means "not asked yet". Cached because it is a subprocess and
+# _is_speaker_card runs once per candidate device per resolve — cleared by refresh_devices(), since
+# a re-plug renumbers cards.
+_speaker_card: str | None = None
+
+
+def _speaker_alsa_card() -> str:
+    """The ALSA card index the speaker sits on, or "" if it cannot be determined.
+
+    Reads `pactl list cards` and finds the block whose `Name:` is TTS_CARD — the card this build
+    already plays through — then returns its `alsa.card` property. That index is what appears as
+    `hw:<N>` in the PortAudio device name, which is what makes the match exact rather than a guess at
+    a product name (see SPEAKER_CARD_NAME_HINTS in config/voice.py for why that matters now).
+
+    Best-effort like everything else in this module: no pactl, no pulse, or a TTS_CARD pulse has
+    never heard of all return "", and the caller falls back to the name hints.
+    """
+    global _speaker_card
+    if _speaker_card is not None:
+        return _speaker_card
+    _speaker_card = ""
+    if not SPEAKER_CARD_FROM_TTS_CARD or not TTS_CARD:
+        return _speaker_card
+    try:
+        out = subprocess.run(["pactl", "list", "cards"], check=True, capture_output=True,
+                             text=True, timeout=MIXER_TIMEOUT_S).stdout
+    except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
+        print(f"[mic] could not ask pactl which card the speaker is on ({exc}) — falling back to "
+              f"matching SPEAKER_CARD_NAME_HINTS against the device name", flush=True)
+        return _speaker_card
+    # `pactl list cards` is blocks separated by "Card #N", each with a "Name:" line and a Properties
+    # section. Walk it linearly rather than parsing properly: we need exactly one field out of one
+    # block, and the format has been stable for a decade.
+    in_card = False
+    for line in out.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("Card #"):
+            in_card = False
+        elif stripped.startswith("Name:"):
+            in_card = stripped.split(":", 1)[1].strip() == TTS_CARD
+        elif in_card and stripped.startswith("alsa.card ") and "=" in stripped:
+            _speaker_card = stripped.split("=", 1)[1].strip().strip('"')
+            print(f"[mic] speaker card {TTS_CARD} is ALSA card {_speaker_card} — input devices on "
+                  f"hw:{_speaker_card} will not be captured", flush=True)
+            break
+    return _speaker_card
+
+
 def _is_speaker_card(name: str) -> bool:
     """True if this input device sits on the same sound card as the speaker.
 
     Capturing there is not merely a bad choice of mic — it is raw ALSA capture on a card that
     tts.play() reconfigures with `pactl set-card-profile` before the first reply, and the process
     segfaulted on the robot doing exactly that (2026-08-11, at the startup greeting). See
-    SPEAKER_CARD_NAME_HINTS in config/voice.py for the log excerpt and the trade."""
+    SPEAKER_CARD_NAME_HINTS in config/voice.py for the log excerpt and the trade.
+
+    Two tiers, in this order and not the other one. If pactl can tell us which ALSA card the speaker
+    is on, that answer is exact and it is the whole answer — a separate USB mic that happens to share
+    the dongle's product name is on a different card and is NOT blocked, which is the point. Only
+    when pactl cannot answer do we fall back to matching the name, which is coarse enough to block a
+    real mic but errs in the safe direction."""
+    card = _speaker_alsa_card()
+    if card:
+        m = _HW_CARD_RE.search(name or "")
+        return bool(m) and m.group(1) == card
     lowered = (name or "").lower()
     return any(hint.lower() in lowered for hint in SPEAKER_CARD_NAME_HINTS if hint)
 
@@ -115,18 +210,32 @@ def _capture_rates_for(kind: str, advertised: int) -> tuple[int, ...]:
     return tuple(rates)
 
 
-def _capture_channels_for(kind: str) -> int:
-    """How many channels to open for a device kind — the INMP441 must be captured in stereo
-    (real audio is only in the left slot); everything else is mono."""
-    return I2S_CAPTURE_CHANNELS if kind == "i2s" else CHANNELS
+def _profile_for(kind: str) -> tuple[int, int, int]:
+    """How to open and probe a device of this kind: (channels, take_channel, silent_retries).
+
+    The INMP441 must be captured in stereo and read from its left slot — a mono open of that
+    stereo-only device fails outright, and its right slot is silent. Everything else is mono channel
+    0, which is not merely the same value by coincidence: passing I2S_TAKE_CHANNEL to a USB mic was
+    harmless only because it happens to be 0, and it would silently read the wrong slot the day
+    someone retunes it for a differently-wired I2S board.
+
+    The retry counts differ for reasons documented at each constant: the I2S mic has a boot-race
+    warm-up worth three extra reads, a USB mic has a hot-plug settling window worth one, and neither
+    number should be spent on the other device."""
+    if kind == "i2s":
+        return I2S_CAPTURE_CHANNELS, I2S_TAKE_CHANNEL, I2S_PROBE_SILENT_RETRIES
+    return CHANNELS, 0, USB_PROBE_SILENT_RETRIES
 
 
 def _candidate_input_devices(devices: list[dict]) -> list[int]:
-    """Distinct input-capable devices to probe, in preference order: I2S (INMP441) first, then
-    USB, then everything else — with the system default heading the 'other' bucket. Keeps one
-    representative per underlying ALSA card (avoids probing 20+ duplicate subdevice entries some
-    cards expose). When no I2S/USB device is present this collapses to 'default first, then cards
-    in order' — the historical behavior.
+    """Distinct input-capable devices to probe, in preference order: the preferred kind first, then
+    the other mic kind, then everything else — with the system default heading the 'other' bucket.
+    Keeps one representative per underlying ALSA card (avoids probing 20+ duplicate subdevice entries
+    some cards expose). When no I2S/USB device is present this collapses to 'default first, then
+    cards in order' — the historical behavior.
+
+    MIC_PREFERENCE only reorders. Every bucket is still probed, so preferring one mic can never leave
+    Kai deaf when only the other one is plugged in — see _preference().
 
     Devices on the speaker's own card are dropped entirely rather than ranked last: they are not a
     worse mic, they are the one choice that can take the process down (_is_speaker_card)."""
@@ -163,7 +272,9 @@ def _candidate_input_devices(devices: list[dict]) -> list[int]:
             seen_cards.add(card)
         buckets[_classify_device(dev.get("name", ""))].append(idx)
         seen.add(idx)
-    return buckets["i2s"] + buckets["usb"] + buckets["other"]
+    order = {"i2s": ("i2s", "usb", "other"),
+             "usb": ("usb", "i2s", "other")}.get(_preference(), ("i2s", "usb", "other"))
+    return [idx for kind in order for idx in buckets[kind]]
 
 
 def _probe_is_live(device: int, rate: int, channels: int = CHANNELS,
@@ -308,6 +419,13 @@ def _pactl_source_names() -> list[str]:
     return names
 
 
+# Every source free_i2s_device() actually suspended, so resume_pulse_sources() can hand back exactly
+# that set. Module-level for the same reason the stream is centralised: suspend and resume happen on
+# different calls, in different objects, and the only correct resume list is the one the suspend
+# built.
+_suspended_sources: list[str] = []
+
+
 def free_i2s_device() -> None:
     """Release the capture cards from pulseaudio so the app can open a raw hw device directly at its
     true rate. pulse otherwise locks the APE card to 44100 and injects noise that garbles speech
@@ -322,18 +440,66 @@ def free_i2s_device() -> None:
     # pulse is not installed), so nothing here may touch pactl when it is False.
     if not I2S_SUSPEND_PULSE:
         return
+    _suspended_sources.clear()
     _pactl_suspend(I2S_PULSE_SOURCE, True)
+    _suspended_sources.append(I2S_PULSE_SOURCE)
     if PULSE_SUSPEND_ALL_SOURCES:
         for src in _pactl_source_names():
             if src != I2S_PULSE_SOURCE:
                 _pactl_suspend(src, True)
+                _suspended_sources.append(src)
 
 
-def resume_pulse_source() -> None:
-    """Hand the card back to pulseaudio — used when we end up NOT capturing from the raw I2S device
-    (fallback to USB/system default), so the pulse-backed path isn't left muted."""
-    if I2S_SUSPEND_PULSE:
-        _pactl_suspend(I2S_PULSE_SOURCE, False)
+def resume_pulse_sources() -> None:
+    """Hand the cards back to pulseaudio — used when we end up NOT capturing from the raw I2S device
+    (a USB mic or the system default), so the pulse-backed paths aren't left muted.
+
+    Resumes everything free_i2s_device() suspended, not just I2S_PULSE_SOURCE. That asymmetry was
+    invisible while USB was only ever a boot-time fallback onto a raw hw device — a suspended source
+    does not stop a raw open, so nothing looked broken. It stops being invisible the moment a run is
+    *meant* to end on the USB mic: PULSE_SUSPEND_ALL_SOURCES had muted that source too, and only the
+    I2S one was ever given back, so pulse-mediated capture on the chosen mic stayed suspended for the
+    life of the process. Idempotent, so calling it on a path that suspended nothing is a no-op."""
+    if not I2S_SUSPEND_PULSE:
+        return
+    for src in _suspended_sources or [I2S_PULSE_SOURCE]:
+        _pactl_suspend(src, False)
+    _suspended_sources.clear()
+
+
+# The old name, kept because it is imported by ai/mic_stream.py, ai/voice_assistant.py and
+# scripts/wake_test.py, and because "resume the pulse source" is still what those call sites mean.
+resume_pulse_source = resume_pulse_sources
+
+
+def refresh_devices() -> bool:
+    """Make PortAudio re-read the ALSA device list. Returns True if it did.
+
+    ⚠ MUST NOT be called while any stream is open. This tears the PortAudio host API down and builds
+    it again, which invalidates every open stream — the one safe window is inside MicStream.reopen(),
+    between closing the old stream and opening the new one, and that is the only caller.
+
+    It exists because PortAudio snapshots the device list at Pa_Initialize and never refreshes it.
+    Everything downstream of that snapshot — sd.query_devices(), the whole of resolve_input_device(),
+    and therefore the dashboard's "find the microphone again" button — is blind to a card plugged in
+    after startup, for the life of the process. That is not a hot-plug limitation we chose to accept;
+    it is why the button could not find a newly plugged mic and why a restart used to be the only way.
+
+    Also drops the speaker-card cache: a re-plug renumbers ALSA cards, so the index resolved before
+    the change may name a different card after it."""
+    global _speaker_card
+    _speaker_card = None
+    _speaker_card_logged.clear()
+    try:
+        sd._terminate()
+        sd._initialize()
+    except Exception as exc:
+        # Best-effort like the rest of this module. A failure here means the device list is stale,
+        # not that the mic is gone — the caller goes on to open whatever the old list still offers.
+        print(f"[mic] WARNING: could not re-scan audio devices ({type(exc).__name__}: {exc}) — "
+              f"a mic plugged in since startup may still be invisible", flush=True)
+        return False
+    return True
 
 
 def resolve_input_device() -> MicChoice:
@@ -345,19 +511,19 @@ def resolve_input_device() -> MicChoice:
     except Exception:
         return MicChoice(None, SAMPLE_RATE, CHANNELS, 0, "int16", False)
     for idx in _candidate_input_devices(devices):
-        kind     = _classify_device(devices[idx].get("name", ""))
-        channels = _capture_channels_for(kind)
+        kind = _classify_device(devices[idx].get("name", ""))
+        channels, take_channel, retries = _profile_for(kind)
         advertised = int(devices[idx].get("default_samplerate") or SAMPLE_RATE)
         # Every rate here is one MicStream can actually resample; a device that opens at none of
         # them is skipped rather than returned. Returning an unusable rate is what took the session
         # down on 2026-08-09 — see _capture_rates_for and FALLBACK_CAPTURE_RATES.
-        # Only the I2S mic gets the silence retries: it is the one device with a warm-up, and it is
-        # also the preferred one, so a single mistimed read there costs the whole session its best
-        # mic. Silence from the USB/default devices is taken at face value.
-        retries = I2S_PROBE_SILENT_RETRIES if kind == "i2s" else 0
+        # How many silent reads to forgive, and which channel holds the audio, both come from
+        # _profile_for — they differ per device kind and the reasons are recorded there.
         for rate in _capture_rates_for(kind, advertised):
-            if _probe_is_live(idx, rate, channels, I2S_TAKE_CHANNEL, retries):
-                return MicChoice(idx, rate, channels, I2S_TAKE_CHANNEL, "int16", kind == "i2s")
+            if _probe_is_live(idx, rate, channels, take_channel, retries):
+                print(f"[mic] selected {kind} mic: device {idx} "
+                      f"({devices[idx].get('name', '?')}) at {rate} Hz", flush=True)
+                return MicChoice(idx, rate, channels, take_channel, "int16", kind == "i2s", kind)
     print("[voice_assistant] WARNING: every candidate input device read as silent or refused every "
           "usable rate — falling back to system default mic (recordings may be empty)")
     return MicChoice(None, SAMPLE_RATE, CHANNELS, 0, "int16", False)

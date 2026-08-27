@@ -72,7 +72,7 @@ speech pantomime never contends with pan/tilt for the 10 Hz gate.
 One always-open capture stream, fanned out to several consumers. Nothing here needs the camera.
 
 ```
-INMP441 I2S mic (raw hw, PulseAudio suspended)
+INMP441 I2S mic (raw hw, PulseAudio suspended)  — or a USB mic; ai/mic_device.py picks
    │  one opener only — everything shares this stream
    ▼
 ai/mic_stream.py   PortAudio callback: slice, copy, enqueue (never blocks)
@@ -146,6 +146,7 @@ kai/
 │   ├── session.py         Hands-free conversation: the state machine and every timer
 │   ├── mic_stream.py      The process's ONE open capture stream, fanned out to consumers
 │   ├── mic_device.py      Which mic to open: ALSA route, pulse suspend, liveness probe
+│   ├── mic_hotplug.py     Notices a mic plugged in or pulled out, so swapping needs no restart
 │   ├── audio.py           Resampler, framing, pre-roll, capture buffer, wake chain, VAD
 │   ├── audio_debug.py     Optional on-disk corpus of what Kai actually heard
 │   ├── voice_assistant.py One turn: STT -> LLM -> TTS + jaw, with turn epochs

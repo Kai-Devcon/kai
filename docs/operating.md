@@ -167,11 +167,37 @@ one case needing a second look was the one case it skipped.
 
 ```bash
 curl -X POST localhost:8081/audio/reresolve
-# {"ok":true,"device":5,"rate":48000,"is_i2s":true,"live":true,"restarted_session":false,...}
+# {"ok":true,"device":5,"rate":48000,"kind":"i2s","is_i2s":true,"live":true,...}
 ```
 
 The reply says *which* mic it landed on, because "it worked" is not the whole answer — Kai on the
-fallback dongle when it should be on the I2S mic is a different situation with a different next step.
+USB mic when he should be on the I2S mic is a different situation with a different next step.
+
+### Switching microphones
+
+Kai takes both the built-in INMP441 and a USB mic, and you rarely have to do anything: plugging one
+in or pulling one out is noticed within a few seconds and applied at the next quiet moment. A swap
+never interrupts a turn in progress — if you plug a mic in while Kai is listening or replying, the
+change waits for the turn to finish.
+
+To choose deliberately, set **Prefer** on the Microphone card (or `POST /settings` with
+`mic_preference` of `auto`, `i2s` or `usb`) and press *Find the microphone again*. Unlike every knob
+in the Settings panel, this one does not apply the instant it changes — a preference is only read
+while a mic is being resolved — which is why it sits next to the button that resolves one.
+
+It reorders, it does not restrict. Preferring the USB mic still falls back to the INMP441 when no
+USB mic is live, and vice versa. Two things to check when a swap does not go the way you expected:
+
+```bash
+curl -s localhost:8081/params | jq '{kind:.sess_mic_kind, watching:.sess_mic_hotplug_watching,
+                                     swaps:.sess_mic_hotswaps, live:.sess_mic_live}'
+```
+
+- `watching: false` means the hot-plug watcher is off — it could not read `/proc/asound/cards`, so
+  mics are only picked up at startup and by the button.
+- `kind` not matching your preference means the preferred mic read as silent or refused to open, and
+  selection fell through. The log says which, per device: `read as silent` and `rejected the probe`
+  are different problems (check the wiring vs. check what is holding the card).
 
 **3. Reboot the Jetson** (`POST /system/reboot`) is **off by default** and needs two deliberate
 steps to switch on — see `REBOOT_ENABLED` in `config/tracking.py`, which explains why. In short:

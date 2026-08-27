@@ -47,7 +47,7 @@ from typing import Any, Callable, NamedTuple
 
 from config.thinking import THINKING_SOUNDS, THINKING_SWEEP
 from config.voice import (
-    DELIVERY_ENABLED, TTS_ENABLED, TTS_LENGTH_SCALE, TTS_NOISE_SCALE, TTS_NOISE_W,
+    DELIVERY_ENABLED, MIC_PREFERENCE, TTS_ENABLED, TTS_LENGTH_SCALE, TTS_NOISE_SCALE, TTS_NOISE_W,
     TTS_SENTENCE_SILENCE_S, TTS_VOLUME,
 )
 from config.wake import HANDS_FREE_ENABLED, VAD_RMS_FLOOR, WAKE_SENSITIVITIES
@@ -91,6 +91,11 @@ _SPECS: dict[str, Spec] = {
     # reply, and live on purpose: it is a change only an ear can judge, so it has to be flippable
     # mid-conversation to A/B against the unshaped voice.
     "delivery_shaping": Spec("bool",   DELIVERY_ENABLED),
+    # Which microphone to prefer. PULL-read by ai/mic_device._preference() on the resolve path only
+    # — never on the audio path — so it needs no on_change wiring, but it also does not take effect
+    # until the next resolve. That is what the dashboard's "find the microphone again" button is
+    # for, and the two controls sit together there for exactly that reason.
+    "mic_preference":   Spec("choice", MIC_PREFERENCE, choices=("auto", "i2s", "usb")),
     "vad_rms_floor":    Spec("float",  VAD_RMS_FLOOR,    lo=50.0, hi=5000.0),
     "wake_sensitivity": Spec("float",  WAKE_SENSITIVITIES[0] if WAKE_SENSITIVITIES else 0.5,
                              lo=0.0, hi=1.0),
