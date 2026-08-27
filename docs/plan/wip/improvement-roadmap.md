@@ -47,6 +47,13 @@ python3 -u face_track.py --network <ip> --no-display --flip --tilt
 > INMP441 I²S MEMS mic and the USB-dongle → PAM8403 → speaker output are wired and configured, the
 > jaw is synced to real WAV duration instead of a time-estimated envelope, and Kai is hands-free
 > via the "Hey Kai" wake word. See the hands-free changelog entry near the top.
+>
+> Two details below have since moved. `resolve_input_device()` lives in `ai/mic_device.py`, not
+> `ai/voice_assistant.py`. And the prediction that the pipeline would "adopt the new input with
+> little/no code change" did not hold: the advertised sample rate turned out to be a hint rather
+> than a capability, and a device offering only 44.1 kHz cannot be resampled to 16 kHz by an
+> integer-ratio decimator at all — see `rnd/challenges.md`. Both mics are supported side by side
+> now, and swapping between them no longer needs a restart (2026-08-27).
 
 **Onboard audio — embedded mic + speaker (cleaner enclosure).** Replace the external USB
 mic with an **embedded microphone**, and add an **on-board 3W–5W speaker**. The goal is a

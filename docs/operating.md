@@ -71,7 +71,7 @@ Every subsystem prefixes its own lines, so `grep` on the tag is the fastest way 
 [camera] CSI camera (sensor 0)
 [camera] live camera acquired: csi
 [wake] engine: porcupine (frame, 512 samples) — skipped none
-[mic] open: device=5 48000 Hz x2 -> 16000 Hz
+[mic] open: device=5 (i2s) 48000 Hz x2 -> 16000 Hz
 [llm] gemma2:2b fully on GPU (2374 MB VRAM)
 [control] 14.9 Hz  face=True
 [face_track] pan=97° sent | 15fps | yaw=52 pitch=48 roll=1 mouth=12 leye=61 reye=60 dist=44 smile=3 emotion=neutral
@@ -87,7 +87,7 @@ Every subsystem prefixes its own lines, so `grep` on the tag is the fastest way 
 | `[control]` | The servo thread's real rate. Edge-triggered on face presence, plus a 30 s heartbeat. If this sags well below 15 Hz, something is holding the GIL |
 | `[camera]` | Acquire / release / probe failures, logged only when the reason changes |
 | `[session]` | State transitions and turn boundaries — the first place to look for a wake that did not land |
-| `[mic]` / `[wake]` | Which device and which wake tier actually won |
+| `[mic]` / `[wake]` | Which device and which wake tier actually won. Also why a candidate mic was rejected — `read as silent` and `rejected the probe` are different problems — and any hot-plug swap |
 | `[turn]` | The latency breakdown, one line per reply. This is how "Kai feels slow" gets attributed |
 | `[llm]` | Ollama placement and per-request timings. A partial GPU offload is called out here |
 

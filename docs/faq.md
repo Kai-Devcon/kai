@@ -48,6 +48,32 @@ Watch the servo, not the console: the firmware is **fire-and-forget and no longe
 **Q: Why can't Kai hear me while it is talking?**
 Because there is no acoustic echo cancellation, so voice barge-in is deliberately off — the mic is gated shut for the whole time Kai's own audio could reach it, plus a settle tail after playback ends. That is what stops the robot answering itself. It is also why replies are length-capped (`TTS_MAX_SPOKEN_CHARS`, `OLLAMA_NUM_PREDICT`): a long reply is a proportionally long deaf spell. The dashboard's mic button always takes precedence and *can* interrupt a reply.
 
+**Q: Can I use a USB microphone instead of the built-in one?**
+Yes, and you usually do not have to do anything: plug it in and Kai switches to it within a few
+seconds. Both mics are probed on every resolve and the first one that captures real signal wins.
+Pick deliberately with **Prefer** on the dashboard's Microphone card (`MIC_PREFERENCE` in
+`config/voice.py`), then press *Find the microphone again* — that setting only takes effect the next
+time a mic is resolved, which is what the button does. It reorders and never restricts: preferring
+the USB mic still falls back to the INMP441 if no USB mic is live, so the setting cannot leave Kai
+deaf. `sess_mic_kind` on `/params` says which one he is actually on.
+
+One caveat worth knowing before you buy: the USB dongle that drives the speaker is *also* an input
+device, and capturing it raw while playback reconfigures the same card segfaulted the process once
+(2026-08-11), so that card is excluded. It is identified by ALSA card index, not by name, so a
+separate USB mic reporting the same generic "USB Audio Device" name is fine. Where `pactl` cannot be
+reached to make that identification, the exclusion falls back to matching the name — and on that
+path a mic with that name is skipped. `docs/hardware.md` has the detail.
+
+**Q: Kai is not picking up the microphone I just plugged in. What now?**
+Check `curl -s localhost:8081/params | jq .sess_mic_hotplug_watching` first. If it is `false`, the
+hot-plug watcher could not read `/proc/asound/cards` and mics are only found at startup and by the
+dashboard button — press *Find the microphone again*. If it is `true`, a swap waits for a quiet
+moment, so it will not happen mid-turn; give it a few seconds after Kai stops talking. If it still
+does not take, the log names the reason per device, and the two reasons want opposite fixes:
+`read as silent` means check the wiring, `rejected the probe` means check what else is holding the
+card. Note that a capture rate that is not a whole multiple of 16 kHz cannot be used at all — a
+44.1 kHz-only device is skipped by design, not by accident.
+
 **Q: How do I change Kai's voice, or how it speaks?**
 The voice model is one line — `TTS_VOICE_MODEL` in `config/voice.py`; several Piper voices are already downloaded in `voices/` and are interchangeable by editing that line. Volume and speaking rate are live in the ⚙ Settings tab. What Kai *says* comes from `ai/persona.txt`, which is re-read on every turn, so edits apply to the next reply with no restart. Before reaching for a different engine, read [docs/plan/completed/expressive-voice-plan.md](plan/completed/expressive-voice-plan.md) — 29 voices across 7 families were measured and rejected the same way, and the conclusion was that the remaining lever is delivery, not timbre.
 
