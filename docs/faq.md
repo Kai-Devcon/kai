@@ -48,14 +48,18 @@ Watch the servo, not the console: the firmware is **fire-and-forget and no longe
 **Q: Why can't Kai hear me while it is talking?**
 Because there is no acoustic echo cancellation, so voice barge-in is deliberately off — the mic is gated shut for the whole time Kai's own audio could reach it, plus a settle tail after playback ends. That is what stops the robot answering itself. It is also why replies are length-capped (`TTS_MAX_SPOKEN_CHARS`, `OLLAMA_NUM_PREDICT`): a long reply is a proportionally long deaf spell. The dashboard's mic button always takes precedence and *can* interrupt a reply.
 
-**Q: Can I use a USB microphone instead of the built-in one?**
-Yes, and you usually do not have to do anything: plug it in and Kai switches to it within a few
-seconds. Both mics are probed on every resolve and the first one that captures real signal wins.
+**Q: Can I use a USB microphone, or a 3.5mm one, instead of the built-in one?**
+Yes to both, and you usually do not have to do anything: plug it in and Kai switches to it within a
+few seconds. Every mic is probed on every resolve and the first one that captures real signal wins.
+A 3.5mm mic needs a **separate USB→3.5mm adapter** — the Jetson has no usable analog input of its
+own, and the mic jack on the dongle driving the speaker is deliberately not usable (see the caveat
+below). Read the three buying gotchas in `docs/hardware.md` first; the common one is that a
+44.1 kHz-only adapter cannot be used at all.
 Pick deliberately with **Prefer** on the dashboard's Microphone card (`MIC_PREFERENCE` in
 `config/voice.py`), then press *Find the microphone again* — that setting only takes effect the next
 time a mic is resolved, which is what the button does. It reorders and never restricts: preferring
-the USB mic still falls back to the INMP441 if no USB mic is live, so the setting cannot leave Kai
-deaf. `sess_mic_kind` on `/params` says which one he is actually on.
+one mic still falls back to the others if it is not live, so the setting cannot leave Kai deaf.
+`sess_mic_kind` on `/params` says which one he is actually on — `i2s`, `usb`, `analog` or `other`.
 
 One caveat worth knowing before you buy: the USB dongle that drives the speaker is *also* an input
 device, and capturing it raw while playback reconfigures the same card segfaulted the process once

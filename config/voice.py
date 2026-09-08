@@ -47,11 +47,42 @@ I2S_PROBE_RETRY_DELAY_S  = 0.4
 I2S_MIC_NAME_HINTS = ("APE", "tegra-dlink", "i2s")  # INMP441 enumerates on card "APE" / PCM "tegra-dlink-0"
 USB_MIC_NAME_HINTS = ("usb",)
 
-# Which kind of mic to probe FIRST: "auto" (i2s, then usb, then everything else — the historical
-# order), "i2s", or "usb".
+# A 3.5mm analog mic, which on this board can only arrive through a USB audio adapter.
+#
+# The Jetson's own analog input is not wired to anything (see the top of this file), so there is no
+# native analog capture path at all. A USB->3.5mm adapter therefore IS a USB sound card
+# electrically, and that is the whole reason this list has to be matched BEFORE USB_MIC_NAME_HINTS:
+# an adapter's name contains "usb" too, and the more specific rule has to win.
+#
+# WHAT THIS BUYS, precisely: a label and a position in the probe order. Nothing here decides whether
+# a device can be opened. An adapter whose name is not in this list classifies as "usb" and works
+# exactly as it does today — so a wrong guess costs the dashboard the ability to tell two USB inputs
+# apart, and costs MIC_PREFERENCE the ability to choose between them. It never costs a microphone.
+# That property is what makes a name-based rule acceptable for something this un-namable.
+#
+# THESE DEFAULTS ARE PLAUSIBLE, NOT MEASURED. Adapter names are genuinely not distinctive —
+# "USB PnP Sound Device" is used by cheap adapters AND by standalone USB mics — so confirm yours and
+# edit this list:
+#
+#   python3 -c "import sounddevice as sd; print(sd.query_devices())"
+#
+# Rejected alternative: infer "analog" structurally from the card also having output channels. An
+# adapter with a headphone jack does — but so does every USB mic with a monitor output, and a
+# mic-in-only adapter does not. It is not a discriminator, and a wrong structural guess is harder to
+# explain than a wrong name guess because there is no list to correct.
+ANALOG_MIC_NAME_HINTS = ("usb audio codec", "usb advanced audio", "generalplus", "line in", "line-in")
+
+# How many EXTRA silent reads to forgive on an analog adapter. Same as USB and for the same reason:
+# it is a USB device and settles like one. Named separately anyway, because the two are tuned by
+# different facts — this one by how the adapter's ADC comes up, USB_PROBE_SILENT_RETRIES by how a
+# native USB mic does — and collapsing them would make either one impossible to move alone.
+ANALOG_PROBE_SILENT_RETRIES = 1
+
+# Which kind of mic to probe FIRST: "auto" (i2s, then usb, then analog, then everything else),
+# "i2s", "usb", or "analog".
 #
 # This REORDERS the probe, it never excludes a kind. Preferring "usb" still falls through to the
-# INMP441 when no USB mic is live, and vice versa. A preference that could leave Kai deaf would be a
+# INMP441 when no USB mic is live, and so on for every value. A preference that could leave Kai deaf would be a
 # worse control than no control: the whole point of resolve_input_device() is that it keeps looking
 # until something actually captures signal, and a filter would defeat that. Live-settable from the
 # dashboard (settings.py), so switching mics does not need a restart — and an unrecognised value

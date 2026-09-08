@@ -20,6 +20,45 @@ Conventions:
 
 ---
 
+## 2026-09-08 — A 3.5mm mic is a third named input, not an unlabelled USB card
+
+`analog` joins `i2s` and `usb` as a mic kind: selectable in `MIC_PREFERENCE` and on the dashboard,
+reported as `sess_mic_kind`, and picked up by the existing hot-plug watcher with no new machinery.
+See `docs/tickets/S15-analog-mic-is-not-a-selectable-input.md`.
+
+The awkward part is that there is nothing to detect. The Jetson's own analog input is not wired to
+anything, so a 3.5mm mic reaches Kai only through a USB→3.5mm adapter — and that adapter *is* a USB
+sound card. Every signal that might distinguish it from a native USB mic is either shared with one
+or absent, so the rule is a name match (`ANALOG_MIC_NAME_HINTS`) and nothing more, checked **before**
+`USB_MIC_NAME_HINTS` because an adapter's name contains "usb" too.
+
+**That rule is allowed to be wrong, and the design depends on it.** Classification decides a label
+and a position in the probe order — never whether a device can be opened. An adapter whose name is
+not in the list classifies as `usb` and works exactly as it did before; the cost is that the
+dashboard cannot tell two USB inputs apart and `MIC_PREFERENCE` cannot choose between them. Nothing
+about a wrong guess costs a working microphone, which is what makes a name-based rule acceptable for
+hardware this un-namable. The defaults are plausible, not measured — `docs/hardware.md` has the
+one-liner that prints what yours actually reports.
+
+Rejected: inferring `analog` structurally from the card also having output channels. An adapter with
+a headphone jack does, but so does every USB mic with a monitor output, and a mic-in-only adapter
+does not. Not a discriminator — and a wrong structural guess is harder to explain than a wrong name
+guess, because there would be no list to correct.
+
+`MIC_PREFERENCE` is now "preferred kind first, then the standard order" rather than a hand-written
+table per value, so adding a kind no longer means enumerating permutations. `analog` sits after
+`usb` in `auto` on purpose: it is the newer kind, and ordering it earlier would silently change
+which mic an already-working robot picks.
+
+**Not verified on hardware.** Unit-tested only — nobody has plugged a 3.5mm mic into an adapter on
+the robot yet. The three ways this fails that software cannot see are documented in
+`docs/hardware.md`: an adapter offering only 44.1 kHz cannot be used at all (an integer-ratio
+decimator cannot resample it — the 2026-08-09 incident), an electret mic needs plug-in power the
+adapter may not supply, and a 4-pole TRRS plug puts the mic on the wrong contact. All three present
+identically in the log as `read as silent`.
+
+---
+
 ## 2026-08-27 — A USB mic is now a microphone Kai has, not one he settles for
 
 Kai could always fall back to a USB mic when the INMP441 read silent, but only as a fallback, only

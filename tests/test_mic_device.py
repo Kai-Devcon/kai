@@ -25,7 +25,9 @@ from ai.mic_device import (
     resume_pulse_source,
     resume_pulse_sources,
 )
-from config.voice import I2S_PROBE_SILENT_RETRIES, USB_PROBE_SILENT_RETRIES
+from config.voice import (
+    ANALOG_PROBE_SILENT_RETRIES, I2S_PROBE_SILENT_RETRIES, USB_PROBE_SILENT_RETRIES,
+)
 
 
 def reset_module_state():
@@ -950,6 +952,115 @@ class TestResolvedChoiceNamesItsKind(unittest.TestCase):
     def test_the_give_up_fallback_says_other(self):
         with patch("ai.mic_device.sd.query_devices", side_effect=RuntimeError("no portaudio")):
             self.assertEqual(resolve_input_device().kind, "other")
+
+class TestAnalogMicKind(unittest.TestCase):
+    """A 3.5mm mic, which on this board can only arrive through a USB audio adapter.
+
+    That is the whole difficulty: the adapter IS a USB sound card, so every signal that would
+    distinguish it from a native USB mic is either shared with one or absent. The rule is therefore
+    name-based and deliberately allowed to be wrong — it decides label and probe order, never
+    whether a device can be opened.
+    """
+
+    def setUp(self):
+        reset_module_state()
+
+    def test_an_adapter_is_analog_and_not_usb_despite_the_usb_in_its_name(self):
+        # The load-bearing assertion of the whole kind. ANALOG_MIC_NAME_HINTS must be matched before
+        # USB_MIC_NAME_HINTS: check them the other way round and every analog adapter classifies as
+        # 'usb', so the kind exists but is never reached.
+        self.assertEqual(_classify_device("USB Audio CODEC (hw:2,0)"), "analog")
+        self.assertEqual(_classify_device("GeneralPlus USB Audio Device (hw:3,0)"), "analog")
+
+    def test_a_native_usb_mic_is_still_usb(self):
+        self.assertEqual(_classify_device("USB PnP Sound Device (hw:1,0)"), "usb")
+
+    def test_the_i2s_mic_still_wins_over_everything(self):
+        # An APE device is never reclassified, whatever else its name happens to contain.
+        self.assertEqual(_classify_device("APE tegra-dlink-0 (hw:APE,0)"), "i2s")
+
+    def test_an_unrecognised_adapter_degrades_to_usb_rather_than_disappearing(self):
+        # The property that makes a name-based rule acceptable: getting the name wrong costs a
+        # label, not a microphone. Adapter names genuinely are not distinctive.
+        with patch("ai.mic_device.ANALOG_MIC_NAME_HINTS", ()):
+            self.assertEqual(_classify_device("USB Audio CODEC (hw:2,0)"), "usb")
+
+    def test_analog_is_probed_mono_on_channel_zero(self):
+        channels, take, retries = _profile_for("analog")
+        self.assertEqual((channels, take), (1, 0))
+        self.assertEqual(retries, ANALOG_PROBE_SILENT_RETRIES)
+
+    def test_analog_does_not_inherit_the_i2s_take_channel(self):
+        with patch("ai.mic_device.I2S_TAKE_CHANNEL", 1):
+            self.assertEqual(_profile_for("analog")[1], 0)
+
+    def test_a_resolved_adapter_reports_kind_analog(self):
+        devices = [{"name": "USB Audio CODEC (hw:2,0)", "max_input_channels": 1}]
+        with patch("ai.mic_device.sd.query_devices", return_value=devices), \
+             patch("ai.mic_device.sd.default") as default, \
+             patch("ai.mic_device.subprocess.run", side_effect=FileNotFoundError("no pactl")), \
+             patch("ai.mic_device._probe_is_live", return_value=True):
+            default.device = [-1, -1]
+            mic = resolve_input_device()
+        self.assertEqual(mic.kind, "analog")
+        self.assertFalse(mic.is_i2s)
+
+    def test_an_adapter_on_a_card_that_is_not_the_speakers_is_not_excluded(self):
+        # An adapter with a headphone jack is a card with outputs, so it looks structurally like the
+        # speaker dongle. It is only usable because the exclusion is keyed on TTS_CARD's ALSA index
+        # rather than on a name -- pin that, because reverting it would silently lose the mic.
+        with patch("ai.mic_device.subprocess.run",
+                   return_value=MagicMock(stdout=PACTL_CARDS)):        # speaker is ALSA card 2
+            self.assertFalse(_is_speaker_card("USB Audio CODEC (hw:5,0)"))
+            self.assertTrue(_is_speaker_card("USB Audio CODEC (hw:2,0)"))
+
+
+class TestPreferenceAcrossFourKinds(unittest.TestCase):
+    DEVICES = [
+        {"name": "APE tegra-dlink-0 (hw:APE,0)", "max_input_channels": 16},
+        {"name": "USB PnP Sound Device (hw:1,0)", "max_input_channels": 1},
+        {"name": "USB Audio CODEC (hw:2,0)", "max_input_channels": 1},
+        {"name": "some other card (hw:3,0)", "max_input_channels": 2},
+    ]
+
+    def setUp(self):
+        reset_module_state()
+
+    def _order(self, pref):
+        with patch("ai.mic_device._preference", return_value=pref), \
+             patch("ai.mic_device.sd.default") as default, \
+             patch("ai.mic_device.subprocess.run", side_effect=FileNotFoundError("no pactl")):
+            default.device = [-1, -1]
+            return _candidate_input_devices(self.DEVICES)
+
+    def test_auto_puts_analog_after_usb(self):
+        # Deliberately after, not before: analog is the newer kind, and ordering it earlier would
+        # silently change which mic an already-working robot picks.
+        self.assertEqual(self._order("auto"), [0, 1, 2, 3])
+
+    def test_preferring_analog_probes_the_adapter_first(self):
+        self.assertEqual(self._order("analog"), [2, 0, 1, 3])
+
+    def test_preferring_a_kind_leaves_the_rest_in_the_standard_order(self):
+        # "prefer X" is "X, then exactly what you would have got anyway" — the easiest rule to
+        # predict, and the one the dashboard's wording promises.
+        self.assertEqual(self._order("usb"), [1, 0, 2, 3])
+        self.assertEqual(self._order("i2s"), [0, 1, 2, 3])
+
+    def test_every_kind_is_still_probed_under_every_preference(self):
+        for pref in ("auto", "i2s", "usb", "analog", "nonsense"):
+            self.assertCountEqual(self._order(pref), [0, 1, 2, 3], pref)
+
+    def test_the_preference_reader_accepts_analog(self):
+        from ai.mic_device import _preference
+        with patch("ai.mic_device.settings.get", return_value="analog"):
+            self.assertEqual(_preference(), "analog")
+
+    def test_the_preference_reader_still_rejects_nonsense(self):
+        from ai.mic_device import _preference
+        for bad in ("other", "3.5mm", "", None):
+            with patch("ai.mic_device.settings.get", return_value=bad):
+                self.assertEqual(_preference(), "auto", bad)
 
 if __name__ == "__main__":
     unittest.main()

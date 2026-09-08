@@ -45,6 +45,7 @@ import sounddevice as sd
 
 import settings
 from config.voice import (
+    ANALOG_MIC_NAME_HINTS, ANALOG_PROBE_SILENT_RETRIES,
     CHANNELS, FALLBACK_CAPTURE_RATES, I2S_APPLY_ROUTE_ON_STARTUP, I2S_CAPTURE_CHANNELS,
     I2S_CAPTURE_RATE, I2S_MIC_NAME_HINTS, I2S_PROBE_RETRY_DELAY_S, I2S_PROBE_SILENT_RETRIES,
     I2S_PULSE_SOURCE, I2S_ROUTE_CARD, I2S_ROUTE_CONTROLS, I2S_SUSPEND_PULSE, I2S_TAKE_CHANNEL,
@@ -96,12 +97,34 @@ def _alsa_card_of(name: str) -> str:
     m = _HW_CARD_RE.search(name or "")
     return m.group(1) if m else ""
 
+# The order buckets are probed in when nothing is preferred, and the order the rest keep once
+# something is. 'analog' sits after 'usb' rather than before it because it is the newer kind and
+# putting it earlier would silently change which mic an existing robot picks.
+_KINDS = ("i2s", "usb", "analog", "other")
+
+# What MIC_PREFERENCE may say. Deliberately NOT _KINDS: "other" is a bucket, not a choice — it holds
+# the system default and anything unrecognised, so "prefer other" is not a thing an operator can
+# mean. Kept in step with the mic_preference spec in settings.py, which offers exactly these.
+_PREFERENCES = ("auto",) + tuple(k for k in _KINDS if k != "other")
+
+
 def _classify_device(name: str) -> str:
-    """Bucket an input device by its name: 'i2s' (the preferred INMP441/APE mic), 'usb' (the
-    fallback), or 'other'. Case-insensitive substring match; I2S is checked before USB."""
+    """Bucket an input device by its name: 'i2s' (the INMP441/APE mic), 'analog' (a 3.5mm mic on a
+    USB adapter), 'usb' (a native USB mic), or 'other' (the system default and anything unrecognised).
+
+    Case-insensitive substring match, MOST SPECIFIC FIRST — and the order is load-bearing, not
+    stylistic. On this board a 3.5mm mic can only arrive through a USB audio adapter, which IS a USB
+    sound card, so an analog adapter's name contains "usb" as well. Checked the other way round
+    every analog device would classify as 'usb' and the kind would never appear.
+
+    A device that matches nothing lands in 'other' and is still probed and still opened; the bucket
+    decides label and probe order, never eligibility. See ANALOG_MIC_NAME_HINTS in config/voice.py.
+    """
     lowered = (name or "").lower()
     if any(hint.lower() in lowered for hint in I2S_MIC_NAME_HINTS):
         return "i2s"
+    if any(hint.lower() in lowered for hint in ANALOG_MIC_NAME_HINTS if hint):
+        return "analog"
     if any(hint.lower() in lowered for hint in USB_MIC_NAME_HINTS):
         return "usb"
     return "other"
@@ -120,7 +143,7 @@ def _preference() -> str:
         pref = settings.get("mic_preference")
     except Exception:
         pref = MIC_PREFERENCE
-    return pref if pref in ("i2s", "usb", "auto") else "auto"
+    return pref if pref in _PREFERENCES else "auto"
 
 
 # The speaker's ALSA card index, resolved from TTS_CARD via pactl. Three states, and they are
@@ -248,6 +271,8 @@ def _profile_for(kind: str) -> tuple[int, int, int]:
     number should be spent on the other device."""
     if kind == "i2s":
         return I2S_CAPTURE_CHANNELS, I2S_TAKE_CHANNEL, I2S_PROBE_SILENT_RETRIES
+    if kind == "analog":
+        return CHANNELS, 0, ANALOG_PROBE_SILENT_RETRIES
     return CHANNELS, 0, USB_PROBE_SILENT_RETRIES
 
 
@@ -263,7 +288,7 @@ def _candidate_input_devices(devices: list[dict]) -> list[int]:
 
     Devices on the speaker's own card are dropped entirely rather than ranked last: they are not a
     worse mic, they are the one choice that can take the process down (_is_speaker_card)."""
-    buckets: dict[str, list[int]] = {"i2s": [], "usb": [], "other": []}
+    buckets: dict[str, list[int]] = {kind: [] for kind in _KINDS}
     seen: set[int] = set()
 
     try:
@@ -296,8 +321,11 @@ def _candidate_input_devices(devices: list[dict]) -> list[int]:
             seen_cards.add(card)
         buckets[_classify_device(dev.get("name", ""))].append(idx)
         seen.add(idx)
-    order = {"i2s": ("i2s", "usb", "other"),
-             "usb": ("usb", "i2s", "other")}.get(_preference(), ("i2s", "usb", "other"))
+    # Preferred kind first, then the standard order for everything else — so "prefer analog" is
+    # "analog, then exactly what you would have got anyway", which is the easiest rule to predict
+    # and the easiest to state on the dashboard. "auto" is just the standard order.
+    pref = _preference()
+    order = (pref,) + tuple(k for k in _KINDS if k != pref) if pref in _KINDS else _KINDS
     return [idx for kind in order for idx in buckets[kind]]
 
 
