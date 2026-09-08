@@ -20,6 +20,38 @@ Conventions:
 
 ---
 
+## 2026-09-08 — A stale default device index could kill the session-start thread outright
+
+Found by a test guard, not by the robot. `_candidate_input_devices()` bounds-checked the system
+default index only where it read that device's NAME — the append that made it a *candidate* checked
+merely that it was non-negative. An index past the end of the device list therefore became a
+candidate, and `resolve_input_device()` then does `devices[idx]` and raises `IndexError`.
+
+**Nothing caught it.** The `try/except` in `resolve_input_device()` wraps `sd.query_devices()` alone,
+not the candidate loop; `MicStream.open()` has no guard around resolving; and `face_track`'s
+`_start_session()` has none around `_session.start()`. So the exception would kill the
+`kai-session-start` thread, skipping all 14 `SESSION_START_ATTEMPTS` retries — a permanently deaf
+robot, from one stale integer, with a bare traceback as the only clue.
+
+Latent for as long as it existed, because `sd.default.device` and `sd.query_devices()` are the same
+PortAudio state and normally agree. What made it reachable is `refresh_devices()`, added days
+earlier for hot-plug: it tears that state down and rebuilds it, which is exactly when the two can
+disagree. A hot-plug feature turned a dormant bug into a live one.
+
+**How it surfaced is worth recording.** Renaming `resolve_input_device` to
+`resolve_capture_device` made six patch targets in `tests/test_voice_assistant.py` silently no-op,
+so those tests ran the real `ai/mic_device` path: PortAudio enumerated the dev box's actual sound
+cards and the suite sat through a 3 s liveness-probe timeout on each. **The run took 1040 seconds
+instead of 16**, and what it reported depended on which microphones the machine had. Those tests
+never meant to touch hardware — they were protected only incidentally, by patching a name.
+
+So `block_real_audio_hardware()` now patches the layer where the hardware actually is, in the module
+that owns it, for the two classes that resolve devices. A stale patch target now fails in
+milliseconds and for the right reason. Writing that guard is what raised the `IndexError` that
+exposed the bug above.
+
+---
+
 ## 2026-09-08 — The mic jack on the speaker's own dongle, reached through PulseAudio
 
 A single USB dongle with two 3.5mm jacks — speaker out, mic in — is the ordinary way to give Kai

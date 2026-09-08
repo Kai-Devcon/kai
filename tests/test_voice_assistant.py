@@ -31,12 +31,43 @@ def make_segment(text: str):
     return seg
 
 
+def block_real_audio_hardware(case):
+    """Make it impossible for a test in `case` to reach a real capture device.
+
+    Belt to the braces of patching resolve_capture_device by name. These tests already patch the
+    resolution entry point on ai.voice_assistant, and that is what they mean to assert — but that
+    patch protects the hardware only INCIDENTALLY, and only while the name it targets is still the
+    one being called.
+
+    MEASURED when it was not. Renaming resolve_input_device -> resolve_capture_device made six
+    patches silently no-op, so the real ai.mic_device path ran: PortAudio enumerated the dev box's
+    actual sound cards and the suite sat through 3 s liveness-probe timeouts on each. The run took
+    **1040 seconds instead of 16**, and what it reported depended on which microphones the machine
+    happened to have. Failing slowly and nondeterministically is much worse than failing.
+
+    So this patches the layer where the hardware actually is, in the module that actually owns it. A
+    future rename then fails immediately and for the right reason, instead of quietly going to the
+    sound card.
+    """
+    for target, kw in (("ai.mic_device.sd.query_devices", {"return_value": []}),
+                       ("ai.mic_device.sd.rec", {"side_effect": AssertionError(
+                           "a test tried to open a real capture device — a patch target is stale")}),
+                       ("ai.mic_device.subprocess.run", {"side_effect": FileNotFoundError(
+                           "no amixer/pactl in a test")})):
+        p = patch(target, **kw)
+        p.start()
+        case.addCleanup(p.stop)
+
+
 class TestEnsureInputResolved(unittest.TestCase):
     """The assistant's own use of ai/mic_device — ordering and the pulse hand-back.
 
     Patched on ai.voice_assistant, not ai.mic_device: ensure_input_resolved() calls these by bare
     name, so it resolves them through this module's globals (they are re-exported there).
     """
+
+    def setUp(self):
+        block_real_audio_hardware(self)
 
     def test_ensure_input_resolved_delegates_the_whole_sequence(self):
         # This used to inline route/suspend/resolve/resume and assert their order. That sequence now
@@ -68,6 +99,7 @@ class TestEnsureInputResolved(unittest.TestCase):
 
 class TestStateMachine(unittest.TestCase):
     def setUp(self):
+        block_real_audio_hardware(self)
         # ensure_input_resolved()/start_recording() shell out to `amixer` and `pactl`; stub them so
         # no test reconfigures real audio on the Jetson (or spawns a missing binary on a dev box).
         for name in ("apply_i2s_route", "free_i2s_device", "resume_pulse_source"):

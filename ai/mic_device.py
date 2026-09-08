@@ -320,15 +320,23 @@ def _candidate_input_devices(devices: list[dict]) -> list[int]:
     # the speaker's card too, because the default can point straight AT a hw device — the named
     # "default"/"pulse" entries do not match the hints and so are unaffected, which is the point:
     # going through pulse is the safe way to touch that card.
-    default_name = ""
+    # The bounds check belongs on the APPEND, not just on the name read. It used to guard only the
+    # latter, so a default index past the end of `devices` was still added as a candidate — and
+    # resolve_input_device() then does `devices[idx]` and raises IndexError. Nothing catches that:
+    # the try/except there wraps query_devices() alone, MicStream.open() has no guard, and
+    # face_track's session-start thread has none either, so it would kill that thread outright and
+    # skip all SESSION_START_ATTEMPTS retries. A permanently deaf robot from one stale index.
+    #
+    # sd.default.device and sd.query_devices() normally agree, being the same PortAudio state — but
+    # refresh_devices() tears that state down and rebuilds it, which is precisely when they can
+    # disagree, so hot-plug made a latent bug reachable.
     if isinstance(default_idx, int) and 0 <= default_idx < len(devices):
         default_name = devices[default_idx].get("name", "") or ""
-    if (isinstance(default_idx, int) and default_idx >= 0
-            and not _is_speaker_card(default_name)
-            and not (PULSE_CAPTURE_ENABLED
-                     and default_idx in set(_pulse_candidates(devices)))):
-        buckets["other"].append(default_idx)
-        seen.add(default_idx)
+        if (not _is_speaker_card(default_name)
+                and not (PULSE_CAPTURE_ENABLED
+                         and default_idx in set(_pulse_candidates(devices)))):
+            buckets["other"].append(default_idx)
+            seen.add(default_idx)
 
     # When the pulse route owns the pulse-backed entries, the raw phase must not also claim them.
     # Two reasons, and the second is the one that bites: the raw phase probes with every source

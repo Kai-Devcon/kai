@@ -86,6 +86,54 @@ class TestCandidateInputDevices(unittest.TestCase):
         self.assertIn(1, candidates)
 
 
+class TestADefaultIndexPastTheEndOfTheDeviceList(unittest.TestCase):
+    """A stale system-default index must not become an out-of-range candidate.
+
+    The bounds check used to guard only the NAME read, so an index past the end of `devices` was
+    still appended — and resolve_input_device() then does `devices[idx]` and raises IndexError.
+    Nothing catches it: the try/except there wraps query_devices() alone, MicStream.open() has no
+    guard, and face_track's session-start thread has none, so it would kill that thread and skip
+    every SESSION_START_ATTEMPTS retry. One stale index, a permanently deaf robot.
+
+    Normally sd.default.device and sd.query_devices() agree, being the same PortAudio state. What
+    made this reachable is refresh_devices(), which tears that state down and rebuilds it.
+    """
+
+    def setUp(self):
+        reset_module_state()
+
+    def _no_pactl(self):
+        return patch("ai.mic_device.subprocess.run", side_effect=FileNotFoundError("no pactl"))
+
+    def test_an_out_of_range_default_is_not_a_candidate(self):
+        devices = [{"name": "USB PnP Sound Device (hw:1,0)", "max_input_channels": 1}]
+        with patch("ai.mic_device.sd.default") as default, self._no_pactl():
+            default.device = [7, 7]                     # PortAudio was re-initialised under us
+            cands = _candidate_input_devices(devices)
+        self.assertEqual(cands, [0])
+        self.assertTrue(all(i < len(devices) for i in cands), cands)
+
+    def test_an_empty_device_list_yields_no_candidates(self):
+        with patch("ai.mic_device.sd.default") as default, self._no_pactl():
+            default.device = [3, 3]
+            self.assertEqual(_candidate_input_devices([]), [])
+
+    def test_resolution_returns_the_give_up_choice_instead_of_raising(self):
+        # The behaviour that matters: a stale index costs a log line, not the session-start thread.
+        with patch("ai.mic_device.sd.query_devices", return_value=[]),              patch("ai.mic_device.sd.default") as default, self._no_pactl():
+            default.device = [5, 5]
+            choice = resolve_input_device()          # must not raise
+        self.assertIsNone(choice.device)
+
+    def test_a_valid_default_is_still_seeded_first(self):
+        # The fix must not cost the behaviour the seeding exists for.
+        devices = [{"name": "card0 (hw:0,0)", "max_input_channels": 2},
+                   {"name": "card1 (hw:1,0)", "max_input_channels": 2}]
+        with patch("ai.mic_device.sd.default") as default, self._no_pactl():
+            default.device = [1, 1]
+            self.assertEqual(_candidate_input_devices(devices)[0], 1)
+
+
 class TestSpeakerCardIsNeverCaptured(unittest.TestCase):
     """The 2026-08-11 segfault: capturing the card the speaker plays out of.
 
