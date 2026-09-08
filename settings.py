@@ -96,7 +96,7 @@ _SPECS: dict[str, Spec] = {
     # until the next resolve. That is what the dashboard's "find the microphone again" button is
     # for, and the two controls sit together there for exactly that reason.
     "mic_preference":   Spec("choice", MIC_PREFERENCE,
-                             choices=("auto", "i2s", "usb", "analog")),
+                             choices=("auto", "i2s", "usb", "analog", "pulse")),
     "vad_rms_floor":    Spec("float",  VAD_RMS_FLOOR,    lo=50.0, hi=5000.0),
     "wake_sensitivity": Spec("float",  WAKE_SENSITIVITIES[0] if WAKE_SENSITIVITIES else 0.5,
                              lo=0.0, hi=1.0),

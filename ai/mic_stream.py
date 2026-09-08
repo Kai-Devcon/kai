@@ -21,6 +21,7 @@ this module is the wiring between them and the one place a block of audio is all
 
 from __future__ import annotations
 
+import os
 import queue
 import threading
 import time
@@ -30,10 +31,7 @@ import numpy as np
 from ai.audio import (
     CaptureBuffer, Decimator, FrameAssembler, HighPass, RingPreroll, WakeDetector, rms,
 )
-from ai.mic_device import (
-    apply_i2s_route, free_i2s_device, pa_lock, refresh_devices, resolve_input_device,
-    resume_pulse_sources,
-)
+from ai.mic_device import pa_lock, refresh_devices, resolve_capture_device
 from config.voice import SAMPLE_RATE
 from config.wake import (
     CAPTURE_BLOCKSIZE, CAPTURE_HARD_CAP_S, CAPTURE_QUEUE_BLOCKS, MIC_HIGHPASS_HZ, MIC_INPUT_GAIN,
@@ -121,16 +119,12 @@ class MicStream:
         # Each step is logged because every one of them can block on external state (amixer, pulse,
         # ALSA device contention), and without this a hang here is indistinguishable from a hang
         # anywhere else in startup.
-        apply_i2s_route()
-        free_i2s_device()
+        # resolve_capture_device() owns the whole sequence now — the I2S route, and BOTH pulse
+        # states. It has to: the pulse-mediated route needs sources UP and every raw route needs
+        # them suspended, so "suspend, then resolve, then resume" could only ever serve one of them
+        # and the code here used to hard-code the raw one. See S16 / resolve_capture_device.
         print("[mic] resolving input device…", flush=True)
-        mic = resolve_input_device()
-        # Hand pulse back every capture card EXCEPT the one we are about to open raw. `is_i2s` used
-        # to stand in for that test and is the wrong question: a USB mic resolves to hw:<n>,0, just
-        # as raw and just as exclusive, with is_i2s False — so pulse was handed card 3 back and had
-        # re-grabbed the BY-PM700 before this line's own InputStream could open it, failing every
-        # attempt with "Device unavailable" [-9985] while the probe moments earlier read it as live.
-        resume_pulse_sources(keep_card=mic.card)
+        mic = resolve_capture_device()
         print(f"[mic] resolved device={mic.device} rate={mic.rate} ch={mic.channels} "
               f"kind={mic.kind} i2s={mic.is_i2s} — opening stream…", flush=True)
 
@@ -151,6 +145,16 @@ class MicStream:
                     self.error = f"cannot resample {mic.rate} Hz: {exc}"
                     print(f"[mic] ERROR: {self.error}", flush=True)
                     return False
+
+        # Any environment the choice carries has to be in place for the OPEN, not only the probe:
+        # the pulse route names its source with PULSE_SOURCE, and a stream created without it records
+        # from pulse's default instead — the same card by luck, or a different one entirely. Set for
+        # the life of the process on purpose, because the watchdog reopens this stream without going
+        # back through resolve.
+        if mic.env:
+            os.environ.update(mic.env)
+            print(f"[mic] capture environment: "
+                  f"{', '.join(f'{k}={v}' for k, v in mic.env.items())}", flush=True)
 
         try:
             stream = sd.InputStream(

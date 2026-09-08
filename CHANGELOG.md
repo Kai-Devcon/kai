@@ -20,6 +20,63 @@ Conventions:
 
 ---
 
+## 2026-09-08 — The mic jack on the speaker's own dongle, reached through PulseAudio
+
+A single USB dongle with two 3.5mm jacks — speaker out, mic in — is the ordinary way to give Kai
+both, and Kai could not use the mic half at all. Now it can, as a fourth kind, `pulse`.
+`PULSE_CAPTURE_ENABLED`, off by default. See
+`docs/tickets/S16-mic-on-the-speakers-own-dongle.md`.
+
+**Why it was refused.** One dongle is one ALSA card, and the card — not the jack — is the unit of
+configuration. `pactl set-card-profile`, which `tts.play()` asserts before the first reply, acts on
+the whole card; on 2026-08-11 that re-opened the card's ALSA devices underneath a live **raw**
+capture stream and the process took SIGSEGV at the startup greeting, then greeted the room again on
+relaunch. So raw capture there is refused. That guard is unchanged and stays: this route goes
+*around* it, it does not relax it.
+
+**The load-bearing change is that the two routes need opposite pulse states.** A raw hw open of the
+INMP441 needs the card taken off pulse or it is locked to 44100 with noise injected. A
+pulse-mediated capture needs the source pulse holds to be *un*-suspended or it delivers silence.
+`MicStream.open()` ran `free_i2s_device()` once at the top and then resolved — so the pulse route was
+always probed in the one state guaranteed to fail it. That is why the fallback that existed on paper
+never worked, and no amount of naming or preference would have fixed it. Resolving is now two
+phases, each run in the state it needs, ordered by `MIC_PREFERENCE`, and both always run so no
+preference can leave Kai deaf.
+
+That sequence also stopped being copy-pasted. `resolve_capture_device()` in `ai/mic_device.py` owns
+it; `ai/mic_stream.py`, `ai/voice_assistant.py` and `scripts/wake_test.py` all call it instead of
+carrying their own copy. Four copies of a one-phase prelude was tolerable; four copies of a
+two-phase one was not, which is what forced the hoist.
+
+Two smaller things fell out of it:
+
+- **The route owns the pulse-backed device entries outright** when enabled. A test caught the raw
+  phase claiming `"pulse"` as `kind="other"` and pre-empting the route — which would have recorded
+  from pulse's *default* source rather than `PULSE_CAPTURE_SOURCE`: the same card by luck instead of
+  on purpose, and unnamed on the dashboard. With the flag off they go back to being the last-resort
+  fallback, exactly as before.
+- **The source is selected with `PULSE_SOURCE` in our own environment**, not `pactl
+  set-default-source`, which would change what every other program on the box records from. It
+  travels on `MicChoice.env` so the *stream* is created with it too, not just the probe — a probe-only
+  setting would have recorded from the right source once and the wrong one forever after.
+
+**Also: no decimator on this route.** Pulse resamples, so it asks for 16 kHz directly. That deletes
+the 44.1 kHz integer-ratio problem for this route rather than solving it — a dongle that can only do
+44.1 kHz is unusable raw and perfectly usable through here.
+
+**Not verified on hardware, and one thing is genuinely unmeasured:** whether
+`set-card-profile` disturbs a live pulse-mediated capture at all. Going through pulse means there is
+no raw stream to yank, which is the whole reason it should be safe, but nobody has measured it on
+this hardware. If it does, the mic watchdog reopens the stream, so the cost is a reopen at the first
+reply rather than a crash — a bounded downside, which is the argument for shipping it behind a flag
+instead of waiting. `scripts/mic_survey.py --probe --suspend-pulse` measures the other half.
+
+**The physical trade is not fixable in software:** one card puts the mic and speaker on a common
+ground as well as a common chassis, so playback bleed into the mic gets worse, not better. Two
+dongles remain the lower-risk arrangement and need none of this.
+
+---
+
 ## 2026-09-08 — A 3.5mm mic is a third named input, not an unlabelled USB card
 
 `analog` joins `i2s` and `usb` as a mic kind: selectable in `MIC_PREFERENCE` and on the dashboard,

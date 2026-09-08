@@ -1,4 +1,5 @@
 import threading
+import os
 import unittest
 from unittest.mock import MagicMock, patch
 
@@ -37,47 +38,32 @@ class TestEnsureInputResolved(unittest.TestCase):
     name, so it resolves them through this module's globals (they are re-exported there).
     """
 
-    def test_ensure_input_resolved_frees_card_before_probing(self):
+    def test_ensure_input_resolved_delegates_the_whole_sequence(self):
+        # This used to inline route/suspend/resolve/resume and assert their order. That sequence now
+        # lives in mic_device.resolve_capture_device() — it had to, because capture grew a second
+        # route needing the OPPOSITE pulse state, and four inlined copies would have been four
+        # places to teach. So the assistant's contract here is delegation, and the ordering is
+        # asserted where the ordering lives (tests/test_mic_device.py). See S16.
         va = make_assistant()
-        calls = []
-        with patch("ai.voice_assistant.apply_i2s_route",
-                   side_effect=lambda: calls.append("route")), \
-             patch("ai.voice_assistant.free_i2s_device",
-                   side_effect=lambda: calls.append("free")), \
-             patch("ai.voice_assistant.resume_pulse_source",
-                   side_effect=lambda keep_card="": calls.append(f"resume:{keep_card}")), \
-             patch("ai.voice_assistant.resolve_input_device",
-                   side_effect=lambda: (calls.append("resolve"),
-                                        MicChoice(3, 48000, 2, 0, "int16", True,
-                                                  "i2s", "APE"))[1]):
+        with patch("ai.voice_assistant.resolve_capture_device",
+                   return_value=MicChoice(3, 48000, 2, 0, "int16", True, "i2s", "APE")) as resolve:
             va.ensure_input_resolved()
-        # Route applied, cards freed from pulse, THEN probed — and the resume that follows must
-        # name the card being opened raw, so pulse cannot re-grab it out from under the open.
-        self.assertEqual(calls, ["route", "free", "resolve", "resume:APE"])
+        resolve.assert_called_once()
+        self.assertEqual(va._capture_device, 3)
+        self.assertTrue(va._capture_is_i2s)
 
-    def test_ensure_input_resolved_keeps_pulse_off_a_raw_usb_card(self):
-        """The regression this replaced: a USB mic on hw:3,0 is is_i2s=False and every bit as
-        exclusive. Resuming its card before opening it handed pulse the device back, and every
-        open then failed with "Device unavailable" [-9985] on a mic that had just probed live."""
+    def test_ensure_input_resolved_applies_any_environment_the_choice_carries(self):
+        # The pulse route names its source with PULSE_SOURCE, and start_recording() opens its stream
+        # later — so the setting has to outlive the resolve, not just the probe.
         va = make_assistant()
-        with patch("ai.voice_assistant.apply_i2s_route"), \
-             patch("ai.voice_assistant.free_i2s_device"), \
-             patch("ai.voice_assistant.resume_pulse_source") as mock_resume, \
-             patch("ai.voice_assistant.resolve_input_device",
-                   return_value=MicChoice(25, 48000, 1, 0, "int16", False, "usb", "3")):
+        key = "KAI_TEST_PULSE_SOURCE"
+        os.environ.pop(key, None)
+        self.addCleanup(os.environ.pop, key, None)
+        with patch("ai.voice_assistant.resolve_capture_device",
+                   return_value=MicChoice(4, 16000, 1, 0, "int16", False, "pulse", "",
+                                          {key: "some.source"})):
             va.ensure_input_resolved()
-        mock_resume.assert_called_once_with(keep_card="3")
-
-    def test_ensure_input_resolved_resumes_everything_for_a_pulse_device(self):
-        """No card means a pulse-mediated PCM, which is not exclusive — hand every source back."""
-        va = make_assistant()
-        with patch("ai.voice_assistant.apply_i2s_route"), \
-             patch("ai.voice_assistant.free_i2s_device"), \
-             patch("ai.voice_assistant.resume_pulse_source") as mock_resume, \
-             patch("ai.voice_assistant.resolve_input_device",
-                   return_value=MicChoice(None, 16000, 1, 0, "int16", False)):
-            va.ensure_input_resolved()
-        mock_resume.assert_called_once_with(keep_card="")
+        self.assertEqual(os.environ.get(key), "some.source")
 
 
 class TestStateMachine(unittest.TestCase):
@@ -96,7 +82,7 @@ class TestStateMachine(unittest.TestCase):
 
     def test_start_recording_opens_stream(self):
         va = make_assistant()
-        with patch("ai.voice_assistant.resolve_input_device",
+        with patch("ai.voice_assistant.resolve_capture_device",
                    return_value=MicChoice(None, 16000, 1, 0, "int16")), \
              patch("ai.voice_assistant.sd.InputStream") as mock_stream_cls:
             mock_stream = MagicMock()
@@ -108,7 +94,7 @@ class TestStateMachine(unittest.TestCase):
 
     def test_start_recording_opens_i2s_stereo_and_frees_pulse(self):
         va = make_assistant()
-        with patch("ai.voice_assistant.resolve_input_device",
+        with patch("ai.voice_assistant.resolve_capture_device",
                    return_value=MicChoice(3, 48000, 2, 0, "int16", True)), \
              patch("ai.voice_assistant.sd.InputStream") as mock_stream_cls:
             mock_stream_cls.return_value = MagicMock()
@@ -120,19 +106,23 @@ class TestStateMachine(unittest.TestCase):
         # I2S capture must (re)free the card from pulse before opening the stream
         self.mock_free_i2s_device.assert_called()
 
-    def test_start_recording_non_i2s_hands_pulse_back(self):
+    def test_start_recording_does_not_re_free_the_card_for_a_non_i2s_mic(self):
+        # Handing pulse back on a non-I2S choice is resolve_capture_device()'s job now, and it is
+        # asserted there. What matters HERE is the inverse of the I2S case above: a mic that is not
+        # the raw device must NOT have the card yanked off pulse underneath it, which is exactly
+        # what re-asserting the suspend would do — and for the pulse route it would be fatal.
         va = make_assistant()
-        with patch("ai.voice_assistant.resolve_input_device",
+        self.mock_free_i2s_device.reset_mock()
+        with patch("ai.voice_assistant.resolve_capture_device",
                    return_value=MicChoice(None, 16000, 1, 0, "int16", False)), \
              patch("ai.voice_assistant.sd.InputStream") as mock_stream_cls:
             mock_stream_cls.return_value = MagicMock()
             va.start_recording()
-        # non-I2S resolution resumes pulse (so the pulse-backed fallback isn't left muted)
-        self.mock_resume_pulse_source.assert_called()
+        self.mock_free_i2s_device.assert_not_called()
 
     def test_start_recording_rejected_while_recording(self):
         va = make_assistant()
-        with patch("ai.voice_assistant.resolve_input_device",
+        with patch("ai.voice_assistant.resolve_capture_device",
                    return_value=MicChoice(None, 16000, 1, 0, "int16")), \
              patch("ai.voice_assistant.sd.InputStream"):
             va.start_recording()
@@ -146,7 +136,7 @@ class TestStateMachine(unittest.TestCase):
 
     def test_stop_recording_transitions_and_spawns_worker(self):
         va = make_assistant()
-        with patch("ai.voice_assistant.resolve_input_device",
+        with patch("ai.voice_assistant.resolve_capture_device",
                    return_value=MicChoice(None, 16000, 1, 0, "int16")), \
              patch("ai.voice_assistant.sd.InputStream"):
             va.start_recording()
@@ -159,7 +149,7 @@ class TestStateMachine(unittest.TestCase):
 
     def test_start_recording_mic_failure_sets_error(self):
         va = make_assistant()
-        with patch("ai.voice_assistant.resolve_input_device",
+        with patch("ai.voice_assistant.resolve_capture_device",
                    return_value=MicChoice(None, 16000, 1, 0, "int16")), \
              patch("ai.voice_assistant.sd.InputStream", side_effect=OSError("no device")):
             result = va.start_recording()
@@ -168,7 +158,7 @@ class TestStateMachine(unittest.TestCase):
 
     def test_device_resolution_only_probed_once(self):
         va = make_assistant()
-        with patch("ai.voice_assistant.resolve_input_device",
+        with patch("ai.voice_assistant.resolve_capture_device",
                    return_value=MicChoice(2, 44100, 2, 0, "int16")) as mock_resolve:
             va.ensure_input_resolved()
             va.ensure_input_resolved()
@@ -1268,7 +1258,7 @@ class TestSharedMicCapture(unittest.TestCase):
     def test_start_recording_skips_device_resolution_entirely(self):
         va = make_assistant()
         va.attach_mic(_FakeMic())
-        with patch("ai.voice_assistant.resolve_input_device") as mock_resolve, \
+        with patch("ai.voice_assistant.resolve_capture_device") as mock_resolve, \
              patch("ai.voice_assistant.tts.stop"):
             va.start_recording()
         mock_resolve.assert_not_called()

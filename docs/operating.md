@@ -175,14 +175,15 @@ USB mic when he should be on the I2S mic is a different situation with a differe
 
 ### Switching microphones
 
-Kai takes three kinds of microphone — the built-in INMP441 (`i2s`), a USB mic (`usb`), and a 3.5mm
-mic on a USB adapter (`analog`) — and you rarely have to do anything: plugging one in or pulling one
+Kai takes four kinds of microphone — the built-in INMP441 (`i2s`), a USB mic (`usb`), a 3.5mm mic on
+a separate USB adapter (`analog`), and the mic jack on the dongle that also drives the speaker
+(`pulse`, off unless `PULSE_CAPTURE_ENABLED` is set) — and you rarely have to do anything: plugging one in or pulling one
 out is noticed within a few seconds and applied at the next quiet moment. A swap never interrupts a
 turn in progress — if you plug a mic in while Kai is listening or replying, the change waits for the
 turn to finish.
 
 To choose deliberately, set **Prefer** on the Microphone card (or `POST /settings` with
-`mic_preference` of `auto`, `i2s`, `usb` or `analog`) and press *Find the microphone again*. Unlike
+`mic_preference` of `auto`, `i2s`, `usb`, `analog` or `pulse`) and press *Find the microphone again*. Unlike
 every knob in the Settings panel, this one does not apply the instant it changes — a preference is
 only read while a mic is being resolved — which is why it sits next to the button that resolves one.
 

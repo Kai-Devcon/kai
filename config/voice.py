@@ -78,8 +78,61 @@ ANALOG_MIC_NAME_HINTS = ("usb audio codec", "usb advanced audio", "generalplus",
 # native USB mic does — and collapsing them would make either one impossible to move alone.
 ANALOG_PROBE_SILENT_RETRIES = 1
 
+# ── Capturing the mic jack on the SPEAKER's own dongle, through PulseAudio ──────
+# A single USB dongle with two 3.5mm jacks — speaker out, mic in — is the ordinary way to give Kai
+# both, and it is the hardware this build already has (see SPEAKER_CARD_NAME_HINTS below: the
+# C-Media dongle is both TTS_SINK and a one-channel input). Kai could not use that mic at all.
+#
+# WHY NOT, precisely. One dongle is ONE ALSA card, and the card is the unit of configuration:
+#
+#   card N --+-- playback hw:N,0   sink:   alsa_output.usb-<product>-00.analog-stereo
+#            +-- capture  hw:N,0   source: alsa_input.usb-<product>-00.mono-fallback
+#
+# `pactl set-card-profile`, which tts.play() asserts before the first reply, acts on the whole card.
+# On 2026-08-11 that re-opened the card's ALSA devices underneath a live RAW PortAudio capture stream
+# and the process took SIGSEGV at the startup greeting. So raw capture on that card is refused, and
+# stays refused — see _is_speaker_card().
+#
+# But the hazard is RAW capture on that card, not capture on that card. Pulse serialises access to
+# the card, so a pulse-mediated stream has no raw ALSA device for a profile change to pull out from
+# under it. That is the route this enables, and it is the same claim already made further down: "Pulse
+# coordinates access to the card, so it is safe where a raw open is not."
+#
+# STILL UNMEASURED, and worth knowing before you turn this on: whether set-card-profile disturbs a
+# live pulse-mediated capture at all. If it does, the mic watchdog (MIC_STALL_S) reopens the stream,
+# so the cost is a reopen at the first reply rather than a crash. That bounded downside is why this
+# ships behind a flag instead of waiting for hardware.
+#
+# OFF BY DEFAULT. A robot that works today must not change behaviour because this landed.
+PULSE_CAPTURE_ENABLED = False
+
+# The pulse source to record from. `pactl list short sources` — it is the alsa_input.* name on the
+# same card as TTS_SINK. Set to "" to use whatever pulse's default source is, which is a worse idea
+# than it sounds: the default moves when devices come and go.
+PULSE_CAPTURE_SOURCE = "alsa_input.usb-C-Media_Electronics_Inc._USB_Audio_Device-00.mono-fallback"
+
+# How the source is targeted: PULSE_SOURCE in the process environment, which libpulse reads when a
+# recording stream is created. Deliberately NOT `pactl set-default-source`, which would change what
+# every other program on the box records from — this build already treats global audio state as
+# something to assert narrowly and put back (see free_i2s_device / resume_pulse_sources). It is the
+# mirror of what playback does with `paplay --device=TTS_SINK`.
+PULSE_CAPTURE_ENV_VAR = "PULSE_SOURCE"
+
+# Which PortAudio device entry is the pulse-backed one, tried in order. These are the names ALSA's
+# pulse plugin exposes; "pulse" is the explicit one and "default" is usually routed to it on a box
+# where pulse is running. Matched as case-insensitive EXACT names, not substrings, because "default"
+# appearing inside a longer device name means something else entirely.
+PULSE_CAPTURE_DEVICE_NAMES = ("pulse", "default")
+
+# Capture rate for the pulse route. Pulse resamples for us, so ask for the rate the pipeline wants
+# and skip the decimator entirely (MicStream.open() already does this when rate == SAMPLE_RATE).
+# That deletes the 44.1 kHz integer-ratio problem for this route rather than solving it: a card that
+# can only do 44.1 kHz is unusable raw but perfectly usable through pulse.
+PULSE_CAPTURE_RATE = SAMPLE_RATE
+
 # Which kind of mic to probe FIRST: "auto" (i2s, then usb, then analog, then everything else),
-# "i2s", "usb", or "analog".
+# "i2s", "usb", "analog", or "pulse" (the mic jack on the speaker's own dongle — needs
+# PULSE_CAPTURE_ENABLED, see below).
 #
 # This REORDERS the probe, it never excludes a kind. Preferring "usb" still falls through to the
 # INMP441 when no USB mic is live, and so on for every value. A preference that could leave Kai deaf would be a

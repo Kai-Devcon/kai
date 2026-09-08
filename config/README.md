@@ -35,7 +35,7 @@ live from the dashboard (fifteen in the ⚙ Settings tab, plus the mic preferenc
 | Hands-free wake word | `wake.py` `HANDS_FREE_ENABLED` | immediately |
 | Wake sensitivity | `wake.py` `WAKE_SENSITIVITIES[0]` | immediately (reloads the engine for the Porcupine tier) |
 | Mic noise floor | `wake.py` `VAD_RMS_FLOOR` | immediately |
-| Preferred microphone (`auto`/`i2s`/`usb`/`analog`) | `voice.py` `MIC_PREFERENCE` | **next time a mic is resolved** — the Microphone card's button, a hot-plug, or a restart. The one knob that is not immediate, which is why it lives on that card rather than in the Settings tab |
+| Preferred microphone (`auto`/`i2s`/`usb`/`analog`/`pulse`) | `voice.py` `MIC_PREFERENCE` | **next time a mic is resolved** — the Microphone card's button, a hot-plug, or a restart. The one knob that is not immediate, which is why it lives on that card rather than in the Settings tab |
 | Speak replies | `voice.py` `TTS_ENABLED` | next reply |
 | Volume / Speaking rate | `voice.py` `TTS_VOLUME`, `TTS_LENGTH_SCALE` | next reply, and re-records the cached "Yes?" |
 | Pause between sentences | `voice.py` `TTS_SENTENCE_SILENCE_S` | next reply, and re-records every cached line. 0 restores the pre-2026-08-10 sound, where sentences ran together with no breath |

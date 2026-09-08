@@ -29,7 +29,7 @@ Kai runs with **none** of these attached — "no camera" is a reported state, no
 | USB audio dongle (C-Media) | Output DAC. Named as a PulseAudio sink in `TTS_SINK`, and its card profile is asserted on every start because Pulse flips it to S/PDIF unprompted |
 | PAM8403 amplifier + speaker | Driven from the dongle's analog jack |
 | USB microphone *(optional)* | A supported input, not just a fallback. Plug one in and Kai switches to it within seconds; unplug it and he goes back to the I2S mic |
-| 3.5mm microphone *(optional)* | Also supported, via a **separate USB→3.5mm audio adapter** — the Jetson has no usable analog input of its own. Reported as the `analog` kind |
+| 3.5mm microphone *(optional)* | Also supported. On a **separate** USB→3.5mm adapter it is the `analog` kind; on the **same** dongle that drives the speaker it is the `pulse` kind and needs `PULSE_CAPTURE_ENABLED` |
 
 ### Which microphone Kai uses
 
@@ -72,7 +72,41 @@ Getting that list wrong is cosmetic: an unmatched adapter classifies as `usb` an
 exactly as before. What it costs is the dashboard's ability to tell two USB inputs apart, and
 `MIC_PREFERENCE`'s ability to choose between them.
 
-Three ways this fails that no amount of software can see, worth knowing **before you buy**:
+#### One dongle for both, or two dongles?
+
+A dongle with two jacks — headphone out and mic in — can serve both, but the two arrangements are
+not equally simple:
+
+| | Card layout | What it needs |
+|---|---|---|
+| **Two dongles** (mic on one, speaker on the other) | separate cards | nothing; works as shipped. Mic is the `analog` kind |
+| **One dongle** (both jacks) | one shared card | `PULSE_CAPTURE_ENABLED`, and the mic becomes the `pulse` kind |
+
+One dongle is **one ALSA card**, and the card — not the jack — is the unit of configuration:
+
+```
+card N  ──┬── playback  hw:N,0    sink:   alsa_output.usb-<product>-00.analog-stereo
+          └── capture   hw:N,0    source: alsa_input.usb-<product>-00.mono-fallback
+```
+
+`pactl set-card-profile`, which `tts.play()` asserts before the first reply, acts on the whole card.
+That re-opened the card's ALSA devices underneath a live **raw** capture stream on 2026-08-11 and the
+process took SIGSEGV at the startup greeting. So **raw capture on the speaker's card is refused, and
+always will be.** The `pulse` kind routes around it: PulseAudio serialises access to the card, so a
+pulse-mediated stream has no raw device for a profile change to pull out from under it.
+
+To use one dongle for both, three config values must all name that dongle — `TTS_SINK`, `TTS_CARD`
+and `PULSE_CAPTURE_SOURCE` — plus `PULSE_CAPTURE_ENABLED = True`. `scripts/mic_survey.py` prints the
+real names and says whether each resolves. Two upsides worth knowing: pulse resamples, so **a
+44.1 kHz-only dongle is perfectly usable through this route** even though it is unusable raw; and
+the sample-rate gotcha below stops applying.
+
+The downside is physical, not fixable in software: one card puts the mic and speaker on a common
+ground as well as a common chassis, so playback bleed into the mic gets *worse*. There is no echo
+cancellation either way, so barge-in stays off.
+
+Three ways a **separate** adapter fails that no amount of software can see, worth knowing
+**before you buy**:
 
 - **The adapter is 44.1 kHz only.** Kai cannot use it at all — `FALLBACK_CAPTURE_RATES` only offers
   rates that divide evenly into 16 kHz, because an integer-ratio decimator cannot resample 44100 and

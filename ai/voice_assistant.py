@@ -19,6 +19,7 @@ request that was already in flight when it was cleared.
 from __future__ import annotations
 
 import math
+import os
 import threading
 import time
 from pathlib import Path
@@ -33,10 +34,14 @@ from ai import tts
 from ai.audio import normalize_for_asr
 from ai.identity import extract_name
 # Device plumbing lives in ai/mic_device.py — this class is one of its two consumers, not its owner.
-# Re-exported (rather than reached through the module) because ensure_input_resolved() and
-# start_recording() call these by bare name, which is what lets a test patch them here.
+# Re-exported (rather than reached through the module) because start_recording() calls
+# free_i2s_device() and resolve_capture_device() by bare name, which is what lets a test patch them
+# here. apply_i2s_route, resolve_input_device and resume_pulse_source are no longer called from this
+# module — resolve_capture_device() owns that whole sequence now (see ensure_input_resolved) — but
+# stay imported/re-exported because existing tests still patch them by this name.
 from ai.mic_device import (
-    MicChoice, apply_i2s_route, free_i2s_device, resolve_input_device, resume_pulse_source,
+    MicChoice, apply_i2s_route, free_i2s_device, resolve_capture_device, resolve_input_device,
+    resume_pulse_source,
 )
 # Three layers this class uses but does not own. Re-exported for the same reason as mic_device's
 # entry points: _call_ollama, ensure_llm_warm, _speak and _transcribe call them by bare name, so
@@ -231,18 +236,18 @@ class VoiceAssistant:
         return self._scan_model is not None or self._whisper_model is not None
 
     def ensure_input_resolved(self) -> None:
-        """Probe for a live mic once (the probe takes real time); safe to call repeatedly. First
-        applies the I2S capture route and suspends pulseaudio so the raw INMP441 device is live and
-        openable before it's probed; if we don't end up on the I2S device, pulse is handed back."""
+        """Probe for a live mic once (the probe takes real time); safe to call repeatedly.
+
+        Delegates the whole sequence — the I2S route, and the pulse state each capture route needs —
+        to resolve_capture_device(). This used to inline it (route, suspend, resolve, resume), which
+        was one of four copies and, once capture grew a second route needing the OPPOSITE pulse
+        state, one of four places that would have had to learn about it. See S16."""
         if not self._device_resolved:
-            apply_i2s_route()   # best-effort; no-op / graceful fallback when the APE card is absent
-            free_i2s_device()   # release the card from pulse so the raw hw probe can open at 48 kHz
-            choice = resolve_input_device()
-            # Every card back to pulse EXCEPT the one about to be opened raw — on a build with no
-            # module-suspend-on-idle, pulse re-grabs a resumed card immediately and the open then
-            # fails with "Device unavailable". A USB mic on hw:<n>,0 is as exclusive as the I2S one,
-            # which is why this asks for the card rather than for is_i2s. See resume_pulse_sources().
-            resume_pulse_source(keep_card=choice.card)
+            choice = resolve_capture_device()
+            # Any environment the choice needs applies to the stream start_recording() opens later,
+            # not just to the probe — the pulse route names its source this way.
+            if choice.env:
+                os.environ.update(choice.env)
             with self._lock:
                 self._capture_device   = choice.device
                 self._capture_rate     = choice.rate
