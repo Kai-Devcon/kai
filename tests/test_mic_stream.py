@@ -251,35 +251,36 @@ class TestPulseIsKeptOffTheCardBeingOpened(unittest.TestCase):
     resume that used to run here for every non-I2S device took the USB mic away between the probe
     that found it live and the open that needed it: "Device unavailable" [-9985], every attempt,
     forever, on 2026-08-27. `is_i2s` was the wrong test - hw:3,0 is raw and exclusive either way.
+
+    open() now delegates the whole resolve — route, suspend, probe, and the keep_card-aware resume
+    — to resolve_capture_device() (ai/mic_device.py, S16), so these assert on the MicChoice it
+    hands back rather than on the individual steps it used to inline. The keep_card behavior
+    itself is covered directly in tests/test_mic_device.py::TestTwoPhaseResolve.
     """
 
     def _open(self, choice):
         sd = MagicMock()
         with (
-            patch("ai.mic_stream.apply_i2s_route"),
-            patch("ai.mic_stream.free_i2s_device"),
-            patch("ai.mic_stream.resume_pulse_sources") as resume,
-            patch("ai.mic_stream.resolve_input_device", return_value=choice),
+            patch("ai.mic_stream.resolve_capture_device", return_value=choice),
             patch.dict("sys.modules", {"sounddevice": sd}),
         ):
             ok = MicStream().open()
-        return ok, resume, sd
+        return ok, sd
 
     def test_a_raw_usb_mic_keeps_its_own_card_suspended(self):
-        ok, resume, sd = self._open(MicChoice(25, 48000, 1, 0, "int16", False, "usb", "3"))
+        ok, sd = self._open(MicChoice(25, 48000, 1, 0, "int16", False, "usb", "3"))
         self.assertTrue(ok)
-        resume.assert_called_once_with(keep_card="3")
         self.assertEqual(sd.InputStream.call_args.kwargs["device"], 25)
 
     def test_a_raw_i2s_mic_keeps_its_own_card_suspended(self):
-        ok, resume, _ = self._open(MicChoice(6, 48000, 2, 0, "int16", True, "i2s", "APE"))
+        ok, sd = self._open(MicChoice(6, 48000, 2, 0, "int16", True, "i2s", "APE"))
         self.assertTrue(ok)
-        resume.assert_called_once_with(keep_card="APE")
+        self.assertEqual(sd.InputStream.call_args.kwargs["device"], 6)
 
     def test_a_pulse_mediated_device_hands_every_card_back(self):
-        ok, resume, _ = self._open(MicChoice(None, 16000, 1, 0, "int16", False))
+        ok, sd = self._open(MicChoice(None, 16000, 1, 0, "int16", False))
         self.assertTrue(ok)
-        resume.assert_called_once_with(keep_card="")
+        self.assertIsNone(sd.InputStream.call_args.kwargs["device"])
 
 
 class TestPortAudioReinitCannotLandInsideAnOpen(unittest.TestCase):
@@ -310,10 +311,7 @@ class TestPortAudioReinitCannotLandInsideAnOpen(unittest.TestCase):
             return MicChoice(None, 16000, 1, 0, "int16", False)
 
         with (
-            patch("ai.mic_stream.apply_i2s_route"),
-            patch("ai.mic_stream.free_i2s_device"),
-            patch("ai.mic_stream.resume_pulse_sources"),
-            patch("ai.mic_stream.resolve_input_device", side_effect=resolve),
+            patch("ai.mic_stream.resolve_capture_device", side_effect=resolve),
             patch.dict("sys.modules", {"sounddevice": MagicMock()}),
         ):
             MicStream().open()
