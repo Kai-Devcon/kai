@@ -72,7 +72,7 @@ speech pantomime never contends with pan/tilt for the 10 Hz gate.
 One always-open capture stream, fanned out to several consumers. Nothing here needs the camera.
 
 ```
-INMP441 I2S mic (raw hw, PulseAudio suspended)  — or a USB mic; ai/mic_device.py picks
+INMP441 I2S mic (raw hw, PulseAudio suspended)  — or a USB / 3.5mm mic; ai/mic_device.py picks
    │  one opener only — everything shares this stream
    ▼
 ai/mic_stream.py   PortAudio callback: slice, copy, enqueue (never blocks)

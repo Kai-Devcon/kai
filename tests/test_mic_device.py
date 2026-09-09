@@ -5,6 +5,7 @@ BELOW the assistant — which mic to open and how — and none of them needs a V
 or a Whisper model.
 """
 
+import os
 import unittest
 from unittest.mock import MagicMock, patch
 
@@ -21,11 +22,15 @@ from ai.mic_device import (
     apply_i2s_route,
     free_i2s_device,
     refresh_devices,
+    resolve_capture_device,
     resolve_input_device,
+    resolve_pulse_device,
     resume_pulse_source,
     resume_pulse_sources,
 )
-from config.voice import I2S_PROBE_SILENT_RETRIES, USB_PROBE_SILENT_RETRIES
+from config.voice import (
+    ANALOG_PROBE_SILENT_RETRIES, I2S_PROBE_SILENT_RETRIES, SAMPLE_RATE, USB_PROBE_SILENT_RETRIES,
+)
 
 
 def reset_module_state():
@@ -79,6 +84,54 @@ class TestCandidateInputDevices(unittest.TestCase):
             candidates = _candidate_input_devices(devices)
         self.assertNotIn(0, candidates)
         self.assertIn(1, candidates)
+
+
+class TestADefaultIndexPastTheEndOfTheDeviceList(unittest.TestCase):
+    """A stale system-default index must not become an out-of-range candidate.
+
+    The bounds check used to guard only the NAME read, so an index past the end of `devices` was
+    still appended — and resolve_input_device() then does `devices[idx]` and raises IndexError.
+    Nothing catches it: the try/except there wraps query_devices() alone, MicStream.open() has no
+    guard, and face_track's session-start thread has none, so it would kill that thread and skip
+    every SESSION_START_ATTEMPTS retry. One stale index, a permanently deaf robot.
+
+    Normally sd.default.device and sd.query_devices() agree, being the same PortAudio state. What
+    made this reachable is refresh_devices(), which tears that state down and rebuilds it.
+    """
+
+    def setUp(self):
+        reset_module_state()
+
+    def _no_pactl(self):
+        return patch("ai.mic_device.subprocess.run", side_effect=FileNotFoundError("no pactl"))
+
+    def test_an_out_of_range_default_is_not_a_candidate(self):
+        devices = [{"name": "USB PnP Sound Device (hw:1,0)", "max_input_channels": 1}]
+        with patch("ai.mic_device.sd.default") as default, self._no_pactl():
+            default.device = [7, 7]                     # PortAudio was re-initialised under us
+            cands = _candidate_input_devices(devices)
+        self.assertEqual(cands, [0])
+        self.assertTrue(all(i < len(devices) for i in cands), cands)
+
+    def test_an_empty_device_list_yields_no_candidates(self):
+        with patch("ai.mic_device.sd.default") as default, self._no_pactl():
+            default.device = [3, 3]
+            self.assertEqual(_candidate_input_devices([]), [])
+
+    def test_resolution_returns_the_give_up_choice_instead_of_raising(self):
+        # The behaviour that matters: a stale index costs a log line, not the session-start thread.
+        with patch("ai.mic_device.sd.query_devices", return_value=[]),              patch("ai.mic_device.sd.default") as default, self._no_pactl():
+            default.device = [5, 5]
+            choice = resolve_input_device()          # must not raise
+        self.assertIsNone(choice.device)
+
+    def test_a_valid_default_is_still_seeded_first(self):
+        # The fix must not cost the behaviour the seeding exists for.
+        devices = [{"name": "card0 (hw:0,0)", "max_input_channels": 2},
+                   {"name": "card1 (hw:1,0)", "max_input_channels": 2}]
+        with patch("ai.mic_device.sd.default") as default, self._no_pactl():
+            default.device = [1, 1]
+            self.assertEqual(_candidate_input_devices(devices)[0], 1)
 
 
 class TestSpeakerCardIsNeverCaptured(unittest.TestCase):
@@ -950,6 +1003,377 @@ class TestResolvedChoiceNamesItsKind(unittest.TestCase):
     def test_the_give_up_fallback_says_other(self):
         with patch("ai.mic_device.sd.query_devices", side_effect=RuntimeError("no portaudio")):
             self.assertEqual(resolve_input_device().kind, "other")
+
+class TestAnalogMicKind(unittest.TestCase):
+    """A 3.5mm mic, which on this board can only arrive through a USB audio adapter.
+
+    That is the whole difficulty: the adapter IS a USB sound card, so every signal that would
+    distinguish it from a native USB mic is either shared with one or absent. The rule is therefore
+    name-based and deliberately allowed to be wrong — it decides label and probe order, never
+    whether a device can be opened.
+    """
+
+    def setUp(self):
+        reset_module_state()
+
+    def test_an_adapter_is_analog_and_not_usb_despite_the_usb_in_its_name(self):
+        # The load-bearing assertion of the whole kind. ANALOG_MIC_NAME_HINTS must be matched before
+        # USB_MIC_NAME_HINTS: check them the other way round and every analog adapter classifies as
+        # 'usb', so the kind exists but is never reached.
+        self.assertEqual(_classify_device("USB Audio CODEC (hw:2,0)"), "analog")
+        self.assertEqual(_classify_device("GeneralPlus USB Audio Device (hw:3,0)"), "analog")
+
+    def test_a_native_usb_mic_is_still_usb(self):
+        self.assertEqual(_classify_device("USB PnP Sound Device (hw:1,0)"), "usb")
+
+    def test_the_i2s_mic_still_wins_over_everything(self):
+        # An APE device is never reclassified, whatever else its name happens to contain.
+        self.assertEqual(_classify_device("APE tegra-dlink-0 (hw:APE,0)"), "i2s")
+
+    def test_an_unrecognised_adapter_degrades_to_usb_rather_than_disappearing(self):
+        # The property that makes a name-based rule acceptable: getting the name wrong costs a
+        # label, not a microphone. Adapter names genuinely are not distinctive.
+        with patch("ai.mic_device.ANALOG_MIC_NAME_HINTS", ()):
+            self.assertEqual(_classify_device("USB Audio CODEC (hw:2,0)"), "usb")
+
+    def test_analog_is_probed_mono_on_channel_zero(self):
+        channels, take, retries = _profile_for("analog")
+        self.assertEqual((channels, take), (1, 0))
+        self.assertEqual(retries, ANALOG_PROBE_SILENT_RETRIES)
+
+    def test_analog_does_not_inherit_the_i2s_take_channel(self):
+        with patch("ai.mic_device.I2S_TAKE_CHANNEL", 1):
+            self.assertEqual(_profile_for("analog")[1], 0)
+
+    def test_a_resolved_adapter_reports_kind_analog(self):
+        devices = [{"name": "USB Audio CODEC (hw:2,0)", "max_input_channels": 1}]
+        with patch("ai.mic_device.sd.query_devices", return_value=devices), \
+             patch("ai.mic_device.sd.default") as default, \
+             patch("ai.mic_device.subprocess.run", side_effect=FileNotFoundError("no pactl")), \
+             patch("ai.mic_device._probe_is_live", return_value=True):
+            default.device = [-1, -1]
+            mic = resolve_input_device()
+        self.assertEqual(mic.kind, "analog")
+        self.assertFalse(mic.is_i2s)
+
+    def test_an_adapter_on_a_card_that_is_not_the_speakers_is_not_excluded(self):
+        # An adapter with a headphone jack is a card with outputs, so it looks structurally like the
+        # speaker dongle. It is only usable because the exclusion is keyed on TTS_CARD's ALSA index
+        # rather than on a name -- pin that, because reverting it would silently lose the mic.
+        with patch("ai.mic_device.subprocess.run",
+                   return_value=MagicMock(stdout=PACTL_CARDS)):        # speaker is ALSA card 2
+            self.assertFalse(_is_speaker_card("USB Audio CODEC (hw:5,0)"))
+            self.assertTrue(_is_speaker_card("USB Audio CODEC (hw:2,0)"))
+
+
+class TestPreferenceAcrossFourKinds(unittest.TestCase):
+    DEVICES = [
+        {"name": "APE tegra-dlink-0 (hw:APE,0)", "max_input_channels": 16},
+        {"name": "USB PnP Sound Device (hw:1,0)", "max_input_channels": 1},
+        {"name": "USB Audio CODEC (hw:2,0)", "max_input_channels": 1},
+        {"name": "some other card (hw:3,0)", "max_input_channels": 2},
+    ]
+
+    def setUp(self):
+        reset_module_state()
+
+    def _order(self, pref):
+        with patch("ai.mic_device._preference", return_value=pref), \
+             patch("ai.mic_device.sd.default") as default, \
+             patch("ai.mic_device.subprocess.run", side_effect=FileNotFoundError("no pactl")):
+            default.device = [-1, -1]
+            return _candidate_input_devices(self.DEVICES)
+
+    def test_auto_puts_analog_after_usb(self):
+        # Deliberately after, not before: analog is the newer kind, and ordering it earlier would
+        # silently change which mic an already-working robot picks.
+        self.assertEqual(self._order("auto"), [0, 1, 2, 3])
+
+    def test_preferring_analog_probes_the_adapter_first(self):
+        self.assertEqual(self._order("analog"), [2, 0, 1, 3])
+
+    def test_preferring_a_kind_leaves_the_rest_in_the_standard_order(self):
+        # "prefer X" is "X, then exactly what you would have got anyway" — the easiest rule to
+        # predict, and the one the dashboard's wording promises.
+        self.assertEqual(self._order("usb"), [1, 0, 2, 3])
+        self.assertEqual(self._order("i2s"), [0, 1, 2, 3])
+
+    def test_every_kind_is_still_probed_under_every_preference(self):
+        for pref in ("auto", "i2s", "usb", "analog", "nonsense"):
+            self.assertCountEqual(self._order(pref), [0, 1, 2, 3], pref)
+
+    def test_the_preference_reader_accepts_analog(self):
+        from ai.mic_device import _preference
+        with patch("ai.mic_device.settings.get", return_value="analog"):
+            self.assertEqual(_preference(), "analog")
+
+    def test_the_preference_reader_still_rejects_nonsense(self):
+        from ai.mic_device import _preference
+        for bad in ("other", "3.5mm", "", None):
+            with patch("ai.mic_device.settings.get", return_value=bad):
+                self.assertEqual(_preference(), "auto", bad)
+
+class PulseRouteCase(unittest.TestCase):
+    """Shared rig for the pulse-mediated route. No pactl, no PortAudio, no real devices."""
+
+    # The one-dongle build: a card carrying BOTH the speaker and a mic jack, plus a pulse-backed
+    # entry. Card 2 is TTS_CARD's ALSA index per PACTL_CARDS.
+    DEVICES = [
+        {"name": "APE tegra-dlink-0 (hw:APE,0)", "max_input_channels": 16},   # 0  raw I2S
+        {"name": "USB Audio Device: - (hw:2,0)", "max_input_channels": 1},    # 1  the MIC JACK, raw
+        {"name": "pulse", "max_input_channels": 32},                          # 2  pulse-mediated
+        {"name": "default", "max_input_channels": 32},                        # 3  pulse-mediated
+    ]
+
+    def setUp(self):
+        reset_module_state()
+        for p in (patch("ai.mic_device.PULSE_CAPTURE_ENABLED", True),
+                  patch("ai.mic_device.PULSE_CAPTURE_SOURCE", "alsa_input.usb-dongle.mono-fallback"),
+                  patch("ai.mic_device.PULSE_CAPTURE_ENV_VAR", "KAI_TEST_PULSE_SOURCE")):
+            p.start()
+            self.addCleanup(p.stop)
+        os.environ.pop("KAI_TEST_PULSE_SOURCE", None)
+        self.addCleanup(os.environ.pop, "KAI_TEST_PULSE_SOURCE", None)
+
+    def rig(self, live=(), devices=None):
+        """Patch PortAudio and pactl. `live` is the device indices whose probe succeeds."""
+        return (
+            patch("ai.mic_device.sd.query_devices", return_value=devices or self.DEVICES),
+            patch("ai.mic_device.sd.default", MagicMock(device=[-1, -1])),
+            patch("ai.mic_device.subprocess.run", return_value=MagicMock(stdout=PACTL_CARDS)),
+            patch("ai.mic_device._probe_is_live",
+                  side_effect=lambda idx, *a, **k: idx in live),
+        )
+
+    def run_rigged(self, fn, live=(), devices=None):
+        from contextlib import ExitStack
+        with ExitStack() as stack:
+            for p in self.rig(live, devices):
+                stack.enter_context(p)
+            return fn()
+
+
+class TestPulseRouteIsReachable(PulseRouteCase):
+    """The point of the whole ticket: the mic jack on the speaker's own dongle becomes usable."""
+
+    def test_the_raw_mic_jack_on_the_speakers_card_is_still_refused(self):
+        # The guard this route goes AROUND, not through. Raw capture there is the 2026-08-11
+        # segfault and stays blocked forever — asserted first, because everything else in this class
+        # would be a regression if this ever stopped holding.
+        cands = self.run_rigged(lambda: _candidate_input_devices(self.DEVICES), live=())
+        self.assertNotIn(1, cands, "raw hw:2,0 is the speaker's card and must never be a candidate")
+
+    def test_the_pulse_route_can_capture_that_same_card(self):
+        mic = self.run_rigged(resolve_pulse_device, live=(2,))
+        self.assertIsNotNone(mic)
+        self.assertEqual(mic.kind, "pulse")
+        self.assertEqual(mic.device, 2)
+        self.assertFalse(mic.is_i2s)
+
+    def test_it_asks_for_the_pipeline_rate_so_no_decimator_is_needed(self):
+        # Pulse resamples for us, which deletes the 44.1 kHz integer-ratio problem for this route
+        # rather than solving it: a card that can only do 44.1 kHz is unusable raw, fine through here.
+        mic = self.run_rigged(resolve_pulse_device, live=(2,))
+        self.assertEqual(mic.rate, SAMPLE_RATE)
+
+    def test_the_choice_carries_the_environment_that_selects_the_source(self):
+        # Not a global default-source change: this steers OUR stream and nothing else's.
+        mic = self.run_rigged(resolve_pulse_device, live=(2,))
+        self.assertEqual(mic.env,
+                         {"KAI_TEST_PULSE_SOURCE": "alsa_input.usb-dongle.mono-fallback"})
+
+    def test_the_probe_environment_does_not_leak_out_of_the_resolve(self):
+        # MicStream re-applies it from MicChoice.env before opening, so it must not be left behind
+        # here — a stray PULSE_SOURCE would silently steer every later recording in the process.
+        self.run_rigged(resolve_pulse_device, live=(2,))
+        self.assertIsNone(os.environ.get("KAI_TEST_PULSE_SOURCE"))
+
+    def test_it_restores_a_pre_existing_value_rather_than_deleting_it(self):
+        os.environ["KAI_TEST_PULSE_SOURCE"] = "someone.elses.choice"
+        self.run_rigged(resolve_pulse_device, live=(2,))
+        self.assertEqual(os.environ["KAI_TEST_PULSE_SOURCE"], "someone.elses.choice")
+
+    def test_device_names_are_matched_exactly_not_as_substrings(self):
+        # "default" inside a longer name means something else entirely, and opening the wrong device
+        # here is how a route that is supposed to be safe would turn out to be the raw one.
+        devices = [{"name": "Default Audio Thing (hw:9,0)", "max_input_channels": 2}]
+        self.assertIsNone(self.run_rigged(resolve_pulse_device, live=(0,), devices=devices))
+
+    def test_config_order_wins_over_enumeration_order(self):
+        # PULSE_CAPTURE_DEVICE_NAMES is ("pulse", "default"): "pulse" is the explicit one, so it is
+        # tried first even though "default" enumerates earlier here.
+        devices = [{"name": "default", "max_input_channels": 32},
+                   {"name": "pulse", "max_input_channels": 32}]
+        mic = self.run_rigged(resolve_pulse_device, live=(0, 1), devices=devices)
+        self.assertEqual(mic.device, 1)
+
+
+class TestPulseRouteOwnsThePulseEntries(PulseRouteCase):
+    """With the route on, the raw phase must not also claim the pulse-backed devices.
+
+    Found by test_falling_through_to_the_pulse_route_resumes_first before this existed: the raw
+    phase picked "pulse" as kind="other" and pre-empted the route. Two things wrong with that, and
+    the second is the one that bites — the raw phase probes with every source suspended, so it reads
+    them silent and wastes the probe; and if it ever DID read one live it would hand back a choice
+    with no env, recording from pulse's default source instead of PULSE_CAPTURE_SOURCE. The same
+    card by luck rather than on purpose, and unnamed on the dashboard.
+    """
+
+    def test_the_raw_phase_skips_pulse_backed_entries(self):
+        cands = self.run_rigged(lambda: _candidate_input_devices(self.DEVICES))
+        self.assertNotIn(2, cands)      # "pulse"
+        self.assertNotIn(3, cands)      # "default"
+        self.assertIn(0, cands)         # the I2S mic is untouched
+
+    def test_it_skips_them_even_when_one_is_the_system_default(self):
+        # The default-device seed bypasses the classification loop, so it needs the check of its own
+        # — the same shape of bug the speaker-card guard already had to fix once.
+        from contextlib import ExitStack
+        with ExitStack() as st:
+            st.enter_context(patch("ai.mic_device.sd.query_devices", return_value=self.DEVICES))
+            st.enter_context(patch("ai.mic_device.sd.default", MagicMock(device=[3, 3])))
+            st.enter_context(patch("ai.mic_device.subprocess.run",
+                                   return_value=MagicMock(stdout=PACTL_CARDS)))
+            cands = _candidate_input_devices(self.DEVICES)
+        self.assertNotIn(3, cands)
+
+    def test_with_the_flag_off_they_are_the_last_resort_fallback_again(self):
+        # Exactly the pre-S16 behaviour: pulse-mediated capture stays reachable as the system
+        # default, just unnamed and unselectable.
+        with patch("ai.mic_device.PULSE_CAPTURE_ENABLED", False):
+            cands = self.run_rigged(lambda: _candidate_input_devices(self.DEVICES))
+        self.assertIn(2, cands)
+        self.assertIn(3, cands)
+
+
+class TestPulseRouteDegradesQuietly(PulseRouteCase):
+    def test_disabled_is_a_no_op_and_touches_nothing(self):
+        with patch("ai.mic_device.PULSE_CAPTURE_ENABLED", False), \
+             patch("ai.mic_device.sd.query_devices") as q:
+            self.assertIsNone(resolve_pulse_device())
+        q.assert_not_called()
+
+    def test_an_unset_source_is_refused_rather_than_guessed(self):
+        # Recording from "whatever pulse's default source happens to be" is a worse failure than
+        # not recording: the default moves as devices come and go, so it would work until it didn't.
+        with patch("ai.mic_device.PULSE_CAPTURE_SOURCE", ""):
+            self.assertIsNone(self.run_rigged(resolve_pulse_device, live=(2, 3)))
+
+    def test_no_pulse_backed_device_present_returns_none(self):
+        devices = [{"name": "USB PnP Sound Device (hw:1,0)", "max_input_channels": 1}]
+        self.assertIsNone(self.run_rigged(resolve_pulse_device, live=(0,), devices=devices))
+
+    def test_a_silent_pulse_source_falls_through(self):
+        self.assertIsNone(self.run_rigged(resolve_pulse_device, live=()))
+
+
+class TestTwoPhaseResolve(PulseRouteCase):
+    """The load-bearing change: each route is probed in the pulse state IT needs.
+
+    A raw hw open of the INMP441 needs pulse off the card; a pulse-mediated capture needs the source
+    pulse holds to be un-suspended. Opposite states, so one prelude cannot serve both — which is
+    exactly why the pulse fallback that existed on paper never worked.
+    """
+
+    def _trace(self, live=(), pref="auto", devices=None):
+        """Record the order of route/suspend/resume/probe so the phase ordering is observable."""
+        from contextlib import ExitStack
+        calls = []
+        with ExitStack() as st:
+            st.enter_context(patch("ai.mic_device.sd.query_devices",
+                                   return_value=devices or self.DEVICES))
+            st.enter_context(patch("ai.mic_device.sd.default", MagicMock(device=[-1, -1])))
+            st.enter_context(patch("ai.mic_device.subprocess.run",
+                                   return_value=MagicMock(stdout=PACTL_CARDS)))
+            st.enter_context(patch("ai.mic_device.apply_i2s_route",
+                                   side_effect=lambda: calls.append("route")))
+            st.enter_context(patch("ai.mic_device.free_i2s_device",
+                                   side_effect=lambda: calls.append("suspend")))
+            st.enter_context(patch("ai.mic_device.resume_pulse_sources",
+                                   side_effect=lambda keep_card="":
+                                       calls.append(f"resume:{keep_card}" if keep_card
+                                                     else "resume")))
+            st.enter_context(patch("ai.mic_device._preference", return_value=pref))
+
+            def probe(idx, *a, **k):
+                calls.append(f"probe:{idx}")
+                return idx in live
+
+            st.enter_context(patch("ai.mic_device._probe_is_live", side_effect=probe))
+            mic = resolve_capture_device()
+        return mic, calls
+
+    def test_preferring_pulse_probes_it_before_anything_is_suspended(self):
+        # The whole fix in one assertion. Suspending first is what made this route read as silent.
+        mic, calls = self._trace(live=(2,), pref="pulse")
+        self.assertEqual(mic.kind, "pulse")
+        self.assertEqual(calls[:2], ["route", "probe:2"])
+        self.assertNotIn("suspend", calls)
+
+    def test_the_raw_phase_probes_with_sources_suspended(self):
+        mic, calls = self._trace(live=(0,), pref="i2s")
+        self.assertEqual(mic.kind, "i2s")
+        self.assertLess(calls.index("suspend"), calls.index("probe:0"))
+
+    def test_a_chosen_i2s_mic_keeps_its_own_card_suspended(self):
+        # The raw I2S device needs the card off pulse to stay off it. resume_pulse_sources() now
+        # runs unconditionally after the raw phase (see resolve_capture_device / keep_card on
+        # MicChoice) — the card is still kept suspended, it is just done by naming it rather than
+        # by skipping the call outright.
+        mic, calls = self._trace(live=(0,), pref="auto")
+        self.assertEqual(mic.kind, "i2s")
+        self.assertIn("resume:APE", calls)
+
+    def test_a_chosen_raw_usb_mic_also_keeps_its_own_card_suspended(self):
+        # The regression this design has to keep fixed (see 11ae9bc "Stop handing pulse the USB mic
+        # back before opening it"): a USB mic is just as raw and just as exclusive as the I2S device,
+        # with is_i2s False — so the card it resolved to, not is_i2s, is what must stay suspended.
+        devices = [{"name": "USB PnP Sound Device (hw:1,0)", "max_input_channels": 1}]
+        mic, calls = self._trace(live=(0,), pref="auto", devices=devices)
+        self.assertEqual(mic.kind, "usb")
+        self.assertIn("resume:1", calls)
+
+    def test_falling_through_to_the_pulse_route_resumes_first(self):
+        # Ordering is the point: resuming AFTER the raw phase rather than before it is what lets
+        # both phases run in one resolve.
+        mic, calls = self._trace(live=(2,), pref="auto")
+        self.assertEqual(mic.kind, "pulse")
+        self.assertIn("resume", calls)
+        self.assertLess(calls.index("resume"), calls.index("probe:2"))
+
+    def test_a_real_raw_mic_beats_the_pulse_route(self):
+        # The pulse route is only preferred over MicChoice(None, ...) — "whatever the system default
+        # turns out to be", which on this build is the same card reached by luck instead of on
+        # purpose. A named raw mic wins.
+        devices = [{"name": "USB PnP Sound Device (hw:1,0)", "max_input_channels": 1},
+                   {"name": "pulse", "max_input_channels": 32}]
+        mic, _ = self._trace(live=(0, 1), pref="auto", devices=devices)
+        self.assertEqual(mic.kind, "usb")
+
+    def test_preferring_pulse_still_falls_back_to_a_raw_mic(self):
+        # No preference may leave Kai deaf — the rule every kind obeys.
+        mic, calls = self._trace(live=(0,), pref="pulse")
+        self.assertEqual(mic.kind, "i2s")
+        self.assertIn("suspend", calls)
+
+    def test_with_the_flag_off_the_sequence_is_exactly_what_it_always_was(self):
+        # A robot that works today must not change behaviour because this landed.
+        with patch("ai.mic_device.PULSE_CAPTURE_ENABLED", False):
+            mic, calls = self._trace(live=(0,), pref="auto")
+        self.assertEqual(calls[:2], ["route", "suspend"])
+        self.assertEqual(mic.kind, "i2s")
+
+    def test_nothing_live_anywhere_still_returns_the_give_up_choice(self):
+        mic, _ = self._trace(live=(), pref="auto")
+        self.assertIsNone(mic.device)
+        self.assertEqual(mic.kind, "other")
+
+    def test_pulse_is_a_selectable_preference_but_not_a_device_bucket(self):
+        # "pulse" is a route, not a bucket of hardware — the card it reaches is deliberately absent
+        # from every bucket. So it belongs in _PREFERENCES and not in _KINDS.
+        self.assertIn("pulse", mic_device._PREFERENCES)
+        self.assertNotIn("pulse", mic_device._KINDS)
+        self.assertNotIn("other", mic_device._PREFERENCES)
 
 if __name__ == "__main__":
     unittest.main()

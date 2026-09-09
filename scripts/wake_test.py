@@ -30,6 +30,7 @@ admits exactly one opener, so stop the service first.
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 import time
 import wave
@@ -41,7 +42,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from ai.audio import Decimator, FrameAssembler, SpeechGate, WakeDetector, rms   # noqa: E402
 from ai.voice_assistant import (                                                # noqa: E402
-    apply_i2s_route, free_i2s_device, resolve_input_device, resume_pulse_source,
+    resolve_capture_device,
 )
 from ai.wake_phrase import match_wake_phrase                                    # noqa: E402
 from config.voice import SAMPLE_RATE                                            # noqa: E402
@@ -70,15 +71,13 @@ def main() -> int:
 
     import sounddevice as sd   # imported late so --help works without the audio stack
 
-    # Same sequence as VoiceAssistant.ensure_input_resolved(): set up the XBAR route, take the card
-    # off pulse so the raw hw probe can open it at 48 kHz, and hand pulse back if we end up
-    # elsewhere. resolve_input_device() never returns None — it falls back to device=None, meaning
-    # "the system default", which is the case that usually reads as digital silence.
-    apply_i2s_route()
-    free_i2s_device()
-    mic = resolve_input_device()
-    if not mic.is_i2s:
-        resume_pulse_source()
+    # The one shared sequence (ai/mic_device.resolve_capture_device): the XBAR route, and the pulse
+    # state each capture route needs — sources suspended for a raw hw open, up for the pulse-mediated
+    # route. Never returns None; it falls back to device=None, meaning "the system default", which is
+    # the case that usually reads as digital silence.
+    mic = resolve_capture_device()
+    if mic.env:
+        os.environ.update(mic.env)   # the pulse route names its source this way
     print(f"[wake_test] mic: device={mic.device} kind={mic.kind} rate={mic.rate} "
           f"channels={mic.channels} take_channel={mic.take_channel} i2s={mic.is_i2s}", flush=True)
     if mic.device is None:

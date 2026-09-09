@@ -175,18 +175,21 @@ USB mic when he should be on the I2S mic is a different situation with a differe
 
 ### Switching microphones
 
-Kai takes both the built-in INMP441 and a USB mic, and you rarely have to do anything: plugging one
-in or pulling one out is noticed within a few seconds and applied at the next quiet moment. A swap
-never interrupts a turn in progress — if you plug a mic in while Kai is listening or replying, the
-change waits for the turn to finish.
+Kai takes four kinds of microphone — the built-in INMP441 (`i2s`), a USB mic (`usb`), a 3.5mm mic on
+a separate USB adapter (`analog`), and the mic jack on the dongle that also drives the speaker
+(`pulse`, off unless `PULSE_CAPTURE_ENABLED` is set) — and you rarely have to do anything: plugging one in or pulling one
+out is noticed within a few seconds and applied at the next quiet moment. A swap never interrupts a
+turn in progress — if you plug a mic in while Kai is listening or replying, the change waits for the
+turn to finish.
 
 To choose deliberately, set **Prefer** on the Microphone card (or `POST /settings` with
-`mic_preference` of `auto`, `i2s` or `usb`) and press *Find the microphone again*. Unlike every knob
-in the Settings panel, this one does not apply the instant it changes — a preference is only read
-while a mic is being resolved — which is why it sits next to the button that resolves one.
+`mic_preference` of `auto`, `i2s`, `usb`, `analog` or `pulse`) and press *Find the microphone again*. Unlike
+every knob in the Settings panel, this one does not apply the instant it changes — a preference is
+only read while a mic is being resolved — which is why it sits next to the button that resolves one.
 
-It reorders, it does not restrict. Preferring the USB mic still falls back to the INMP441 when no
-USB mic is live, and vice versa. Two things to check when a swap does not go the way you expected:
+It reorders, it does not restrict. Preferring any one mic still falls back to the others when it is
+not live, so no setting here can leave Kai deaf. Two things to check when a swap does not go the way
+you expected:
 
 ```bash
 curl -s localhost:8081/params | jq '{kind:.sess_mic_kind, watching:.sess_mic_hotplug_watching,
@@ -198,6 +201,11 @@ curl -s localhost:8081/params | jq '{kind:.sess_mic_kind, watching:.sess_mic_hot
 - `kind` not matching your preference means the preferred mic read as silent or refused to open, and
   selection fell through. The log says which, per device: `read as silent` and `rejected the probe`
   are different problems (check the wiring vs. check what is holding the card).
+- `kind: usb` when you expected `analog` is only a labelling miss — the adapter works, its name just
+  is not in `ANALOG_MIC_NAME_HINTS`. Add it (`docs/hardware.md` has the one-liner that prints the
+  real name). A 3.5mm adapter reading silent is more likely one of the three hardware gotchas listed
+  there — a 44.1 kHz-only adapter, a mic needing plug-in power, or a TRRS plug — than anything in
+  the software.
 
 **If the log selects a mic and then fails to open it,** read the PortAudio error code — the two you
 are likely to see mean different things and neither is a broken microphone:

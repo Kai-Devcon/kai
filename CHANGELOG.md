@@ -20,6 +20,134 @@ Conventions:
 
 ---
 
+## 2026-09-08 — A stale default device index could kill the session-start thread outright
+
+Found by a test guard, not by the robot. `_candidate_input_devices()` bounds-checked the system
+default index only where it read that device's NAME — the append that made it a *candidate* checked
+merely that it was non-negative. An index past the end of the device list therefore became a
+candidate, and `resolve_input_device()` then does `devices[idx]` and raises `IndexError`.
+
+**Nothing caught it.** The `try/except` in `resolve_input_device()` wraps `sd.query_devices()` alone,
+not the candidate loop; `MicStream.open()` has no guard around resolving; and `face_track`'s
+`_start_session()` has none around `_session.start()`. So the exception would kill the
+`kai-session-start` thread, skipping all 14 `SESSION_START_ATTEMPTS` retries — a permanently deaf
+robot, from one stale integer, with a bare traceback as the only clue.
+
+Latent for as long as it existed, because `sd.default.device` and `sd.query_devices()` are the same
+PortAudio state and normally agree. What made it reachable is `refresh_devices()`, added days
+earlier for hot-plug: it tears that state down and rebuilds it, which is exactly when the two can
+disagree. A hot-plug feature turned a dormant bug into a live one.
+
+**How it surfaced is worth recording.** Renaming `resolve_input_device` to
+`resolve_capture_device` made six patch targets in `tests/test_voice_assistant.py` silently no-op,
+so those tests ran the real `ai/mic_device` path: PortAudio enumerated the dev box's actual sound
+cards and the suite sat through a 3 s liveness-probe timeout on each. **The run took 1040 seconds
+instead of 16**, and what it reported depended on which microphones the machine had. Those tests
+never meant to touch hardware — they were protected only incidentally, by patching a name.
+
+So `block_real_audio_hardware()` now patches the layer where the hardware actually is, in the module
+that owns it, for the two classes that resolve devices. A stale patch target now fails in
+milliseconds and for the right reason. Writing that guard is what raised the `IndexError` that
+exposed the bug above.
+
+---
+
+## 2026-09-08 — The mic jack on the speaker's own dongle, reached through PulseAudio
+
+A single USB dongle with two 3.5mm jacks — speaker out, mic in — is the ordinary way to give Kai
+both, and Kai could not use the mic half at all. Now it can, as a fourth kind, `pulse`.
+`PULSE_CAPTURE_ENABLED`, off by default. See
+`docs/tickets/S16-mic-on-the-speakers-own-dongle.md`.
+
+**Why it was refused.** One dongle is one ALSA card, and the card — not the jack — is the unit of
+configuration. `pactl set-card-profile`, which `tts.play()` asserts before the first reply, acts on
+the whole card; on 2026-08-11 that re-opened the card's ALSA devices underneath a live **raw**
+capture stream and the process took SIGSEGV at the startup greeting, then greeted the room again on
+relaunch. So raw capture there is refused. That guard is unchanged and stays: this route goes
+*around* it, it does not relax it.
+
+**The load-bearing change is that the two routes need opposite pulse states.** A raw hw open of the
+INMP441 needs the card taken off pulse or it is locked to 44100 with noise injected. A
+pulse-mediated capture needs the source pulse holds to be *un*-suspended or it delivers silence.
+`MicStream.open()` ran `free_i2s_device()` once at the top and then resolved — so the pulse route was
+always probed in the one state guaranteed to fail it. That is why the fallback that existed on paper
+never worked, and no amount of naming or preference would have fixed it. Resolving is now two
+phases, each run in the state it needs, ordered by `MIC_PREFERENCE`, and both always run so no
+preference can leave Kai deaf.
+
+That sequence also stopped being copy-pasted. `resolve_capture_device()` in `ai/mic_device.py` owns
+it; `ai/mic_stream.py`, `ai/voice_assistant.py` and `scripts/wake_test.py` all call it instead of
+carrying their own copy. Four copies of a one-phase prelude was tolerable; four copies of a
+two-phase one was not, which is what forced the hoist.
+
+Two smaller things fell out of it:
+
+- **The route owns the pulse-backed device entries outright** when enabled. A test caught the raw
+  phase claiming `"pulse"` as `kind="other"` and pre-empting the route — which would have recorded
+  from pulse's *default* source rather than `PULSE_CAPTURE_SOURCE`: the same card by luck instead of
+  on purpose, and unnamed on the dashboard. With the flag off they go back to being the last-resort
+  fallback, exactly as before.
+- **The source is selected with `PULSE_SOURCE` in our own environment**, not `pactl
+  set-default-source`, which would change what every other program on the box records from. It
+  travels on `MicChoice.env` so the *stream* is created with it too, not just the probe — a probe-only
+  setting would have recorded from the right source once and the wrong one forever after.
+
+**Also: no decimator on this route.** Pulse resamples, so it asks for 16 kHz directly. That deletes
+the 44.1 kHz integer-ratio problem for this route rather than solving it — a dongle that can only do
+44.1 kHz is unusable raw and perfectly usable through here.
+
+**Not verified on hardware, and one thing is genuinely unmeasured:** whether
+`set-card-profile` disturbs a live pulse-mediated capture at all. Going through pulse means there is
+no raw stream to yank, which is the whole reason it should be safe, but nobody has measured it on
+this hardware. If it does, the mic watchdog reopens the stream, so the cost is a reopen at the first
+reply rather than a crash — a bounded downside, which is the argument for shipping it behind a flag
+instead of waiting. `scripts/mic_survey.py --probe --suspend-pulse` measures the other half.
+
+**The physical trade is not fixable in software:** one card puts the mic and speaker on a common
+ground as well as a common chassis, so playback bleed into the mic gets worse, not better. Two
+dongles remain the lower-risk arrangement and need none of this.
+
+---
+
+## 2026-09-08 — A 3.5mm mic is a third named input, not an unlabelled USB card
+
+`analog` joins `i2s` and `usb` as a mic kind: selectable in `MIC_PREFERENCE` and on the dashboard,
+reported as `sess_mic_kind`, and picked up by the existing hot-plug watcher with no new machinery.
+See `docs/tickets/S15-analog-mic-is-not-a-selectable-input.md`.
+
+The awkward part is that there is nothing to detect. The Jetson's own analog input is not wired to
+anything, so a 3.5mm mic reaches Kai only through a USB→3.5mm adapter — and that adapter *is* a USB
+sound card. Every signal that might distinguish it from a native USB mic is either shared with one
+or absent, so the rule is a name match (`ANALOG_MIC_NAME_HINTS`) and nothing more, checked **before**
+`USB_MIC_NAME_HINTS` because an adapter's name contains "usb" too.
+
+**That rule is allowed to be wrong, and the design depends on it.** Classification decides a label
+and a position in the probe order — never whether a device can be opened. An adapter whose name is
+not in the list classifies as `usb` and works exactly as it did before; the cost is that the
+dashboard cannot tell two USB inputs apart and `MIC_PREFERENCE` cannot choose between them. Nothing
+about a wrong guess costs a working microphone, which is what makes a name-based rule acceptable for
+hardware this un-namable. The defaults are plausible, not measured — `docs/hardware.md` has the
+one-liner that prints what yours actually reports.
+
+Rejected: inferring `analog` structurally from the card also having output channels. An adapter with
+a headphone jack does, but so does every USB mic with a monitor output, and a mic-in-only adapter
+does not. Not a discriminator — and a wrong structural guess is harder to explain than a wrong name
+guess, because there would be no list to correct.
+
+`MIC_PREFERENCE` is now "preferred kind first, then the standard order" rather than a hand-written
+table per value, so adding a kind no longer means enumerating permutations. `analog` sits after
+`usb` in `auto` on purpose: it is the newer kind, and ordering it earlier would silently change
+which mic an already-working robot picks.
+
+**Not verified on hardware.** Unit-tested only — nobody has plugged a 3.5mm mic into an adapter on
+the robot yet. The three ways this fails that software cannot see are documented in
+`docs/hardware.md`: an adapter offering only 44.1 kHz cannot be used at all (an integer-ratio
+decimator cannot resample it — the 2026-08-09 incident), an electret mic needs plug-in power the
+adapter may not supply, and a 4-pole TRRS plug puts the mic on the wrong contact. All three present
+identically in the log as `read as silent`.
+
+---
+
 ## 2026-08-27 — A USB mic is now a microphone Kai has, not one he settles for
 
 Kai could always fall back to a USB mic when the INMP441 read silent, but only as a fallback, only

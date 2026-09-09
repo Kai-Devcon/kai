@@ -823,7 +823,9 @@ function CameraStatusCard({ data }) {
    real audio every time — but until this existed the only way to take that second look was
    restarting the whole process. One tap, no confirmation: it costs a couple of seconds, keeps the
    camera and the conversation up, and the worst case is that it changes nothing. */
-const MIC_NAMES = { i2s: 'the built-in I2S mic', usb: 'the USB mic', other: 'the system default mic' };
+const MIC_NAMES = { i2s: 'the built-in I2S mic', usb: 'the USB mic',
+                    analog: 'the 3.5mm mic', pulse: "the speaker dongle's mic jack",
+                    other: 'the system default mic' };
 
 function MicRecoveryCard({ data }) {
   const [phase, setPhase] = useState('idle');   /* idle | sending | done | error */
@@ -894,9 +896,16 @@ function MicRecoveryCard({ data }) {
       style: { width: '100%', fontSize: 12, color: C.text, background: 'rgba(255,255,255,0.05)',
         border: '1px solid rgba(255,255,255,0.12)', padding: '7px 8px', borderRadius: 8,
         marginBottom: 8 } },
-      h('option', { value: 'auto' }, 'Auto — built-in mic, then USB'),
+      h('option', { value: 'auto' }, 'Auto — built-in mic, then USB, then 3.5mm'),
       h('option', { value: 'i2s' }, 'The built-in I2S mic'),
-      h('option', { value: 'usb' }, 'A USB mic')),
+      h('option', { value: 'usb' }, 'A USB mic'),
+      /* A 3.5mm mic reaches Kai only through a USB adapter, so it is a USB sound card as far as
+         ALSA is concerned. Named by what the operator plugged in, not by what the bus says. */
+      h('option', { value: 'analog' }, 'A 3.5mm mic (on a USB adapter)'),
+      /* The mic jack on the dongle that also drives the speaker. Raw capture there crashed the
+         process once, so this route goes through PulseAudio instead and is off unless
+         PULSE_CAPTURE_ENABLED is set — picking it on a robot without that does nothing. */
+      h('option', { value: 'pulse' }, "The speaker dongle's own mic jack")),
     /* Both halves matter: a preference only reorders, so saying "preferred" without saying "and the
        other one is still used if this is not there" invites the reading that picking one turns the
        other off. */

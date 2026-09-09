@@ -34,6 +34,7 @@ to the USB/system-default mic rather than raising into startup.
 
 from __future__ import annotations
 
+import os
 import re
 import subprocess
 import threading
@@ -45,6 +46,9 @@ import sounddevice as sd
 
 import settings
 from config.voice import (
+    ANALOG_MIC_NAME_HINTS, ANALOG_PROBE_SILENT_RETRIES,
+    PULSE_CAPTURE_DEVICE_NAMES, PULSE_CAPTURE_ENABLED, PULSE_CAPTURE_ENV_VAR, PULSE_CAPTURE_RATE,
+    PULSE_CAPTURE_SOURCE,
     CHANNELS, FALLBACK_CAPTURE_RATES, I2S_APPLY_ROUTE_ON_STARTUP, I2S_CAPTURE_CHANNELS,
     I2S_CAPTURE_RATE, I2S_MIC_NAME_HINTS, I2S_PROBE_RETRY_DELAY_S, I2S_PROBE_SILENT_RETRIES,
     I2S_PULSE_SOURCE, I2S_ROUTE_CARD, I2S_ROUTE_CONTROLS, I2S_SUSPEND_PULSE, I2S_TAKE_CHANNEL,
@@ -85,9 +89,14 @@ pa_lock = threading.RLock()
 # card", and that is not what is_i2s means: a USB mic resolves to hw:<n>,0 — just as raw, and just
 # as exclusive — with is_i2s False. Handing pulse the card back before opening it is what made a
 # perfectly healthy BY-PM700 fail every open with "Device unavailable" (2026-08-27).
-MicChoice = namedtuple("MicChoice", "device rate channels take_channel dtype is_i2s kind card")
-# is_i2s defaults False, kind "other", card "" (keeps non-i2s call sites terse)
-MicChoice.__new__.__defaults__ = (False, "other", "")
+#
+# `env` carries any process environment the OPEN needs, not just the probe — the pulse route selects
+# its source with PULSE_SOURCE, and the stream MicStream opens afterwards has to be created with the
+# same setting or it records from pulse's default instead. Travelling on the choice keeps that from
+# being a global side effect somebody has to remember to leave in place. None means "nothing extra".
+MicChoice = namedtuple("MicChoice", "device rate channels take_channel dtype is_i2s kind card env")
+# is_i2s defaults False, kind "other", card "", env None (keeps non-i2s call sites terse)
+MicChoice.__new__.__defaults__ = (False, "other", "", None)
 
 
 def _alsa_card_of(name: str) -> str:
@@ -96,12 +105,40 @@ def _alsa_card_of(name: str) -> str:
     m = _HW_CARD_RE.search(name or "")
     return m.group(1) if m else ""
 
+# The order buckets are probed in when nothing is preferred, and the order the rest keep once
+# something is. 'analog' sits after 'usb' rather than before it because it is the newer kind and
+# putting it earlier would silently change which mic an existing robot picks.
+_KINDS = ("i2s", "usb", "analog", "other")
+
+# The pulse-mediated route. Not in _KINDS because it is not a bucket of hardware devices — it is a
+# different WAY to open a card, and the card in question is deliberately absent from every bucket
+# (see _is_speaker_card). It is resolved in its own phase, with pulse UP, because it needs the
+# opposite pulse state from every raw candidate. See PULSE_CAPTURE_ENABLED in config/voice.py.
+KIND_PULSE = "pulse"
+
+# What MIC_PREFERENCE may say. Deliberately NOT _KINDS: "other" is a bucket, not a choice — it holds
+# the system default and anything unrecognised, so "prefer other" is not a thing an operator can
+# mean. Kept in step with the mic_preference spec in settings.py, which offers exactly these.
+_PREFERENCES = ("auto",) + tuple(k for k in _KINDS if k != "other") + (KIND_PULSE,)
+
+
 def _classify_device(name: str) -> str:
-    """Bucket an input device by its name: 'i2s' (the preferred INMP441/APE mic), 'usb' (the
-    fallback), or 'other'. Case-insensitive substring match; I2S is checked before USB."""
+    """Bucket an input device by its name: 'i2s' (the INMP441/APE mic), 'analog' (a 3.5mm mic on a
+    USB adapter), 'usb' (a native USB mic), or 'other' (the system default and anything unrecognised).
+
+    Case-insensitive substring match, MOST SPECIFIC FIRST — and the order is load-bearing, not
+    stylistic. On this board a 3.5mm mic can only arrive through a USB audio adapter, which IS a USB
+    sound card, so an analog adapter's name contains "usb" as well. Checked the other way round
+    every analog device would classify as 'usb' and the kind would never appear.
+
+    A device that matches nothing lands in 'other' and is still probed and still opened; the bucket
+    decides label and probe order, never eligibility. See ANALOG_MIC_NAME_HINTS in config/voice.py.
+    """
     lowered = (name or "").lower()
     if any(hint.lower() in lowered for hint in I2S_MIC_NAME_HINTS):
         return "i2s"
+    if any(hint.lower() in lowered for hint in ANALOG_MIC_NAME_HINTS if hint):
+        return "analog"
     if any(hint.lower() in lowered for hint in USB_MIC_NAME_HINTS):
         return "usb"
     return "other"
@@ -120,7 +157,7 @@ def _preference() -> str:
         pref = settings.get("mic_preference")
     except Exception:
         pref = MIC_PREFERENCE
-    return pref if pref in ("i2s", "usb", "auto") else "auto"
+    return pref if pref in _PREFERENCES else "auto"
 
 
 # The speaker's ALSA card index, resolved from TTS_CARD via pactl. Three states, and they are
@@ -174,7 +211,7 @@ def _speaker_alsa_card() -> str:
 
 
 def _is_speaker_card(name: str) -> bool:
-    """True if this input device sits on the same sound card as the speaker.
+    """True if RAW capture on this input device would land on the speaker's own sound card.
 
     Capturing there is not merely a bad choice of mic — it is raw ALSA capture on a card that
     tts.play() reconfigures with `pactl set-card-profile` before the first reply, and the process
@@ -185,7 +222,14 @@ def _is_speaker_card(name: str) -> bool:
     is on, that answer is exact and it is the whole answer — a separate USB mic that happens to share
     the dongle's product name is on a different card and is NOT blocked, which is the point. Only
     when pactl cannot answer do we fall back to matching the name, which is coarse enough to block a
-    real mic but errs in the safe direction."""
+    real mic but errs in the safe direction.
+
+    NOTE what this does and does not forbid. The hazard is a RAW ALSA capture stream on the card a
+    profile change re-opens — not capture on that card by any means. Pulse serialises access to the
+    card, so a pulse-mediated stream has no raw device to lose, and _resolve_pulse_device() may
+    legitimately return that very card. This function is only ever asked about raw `hw:` candidates,
+    and it must keep refusing every one of them: the pulse route routes AROUND this guard, it does
+    not relax it."""
     card = _speaker_alsa_card()
     if card:
         m = _HW_CARD_RE.search(name or "")
@@ -248,6 +292,8 @@ def _profile_for(kind: str) -> tuple[int, int, int]:
     number should be spent on the other device."""
     if kind == "i2s":
         return I2S_CAPTURE_CHANNELS, I2S_TAKE_CHANNEL, I2S_PROBE_SILENT_RETRIES
+    if kind == "analog":
+        return CHANNELS, 0, ANALOG_PROBE_SILENT_RETRIES
     return CHANNELS, 0, USB_PROBE_SILENT_RETRIES
 
 
@@ -263,7 +309,7 @@ def _candidate_input_devices(devices: list[dict]) -> list[int]:
 
     Devices on the speaker's own card are dropped entirely rather than ranked last: they are not a
     worse mic, they are the one choice that can take the process down (_is_speaker_card)."""
-    buckets: dict[str, list[int]] = {"i2s": [], "usb": [], "other": []}
+    buckets: dict[str, list[int]] = {kind: [] for kind in _KINDS}
     seen: set[int] = set()
 
     try:
@@ -274,16 +320,36 @@ def _candidate_input_devices(devices: list[dict]) -> list[int]:
     # the speaker's card too, because the default can point straight AT a hw device — the named
     # "default"/"pulse" entries do not match the hints and so are unaffected, which is the point:
     # going through pulse is the safe way to touch that card.
-    default_name = ""
+    # The bounds check belongs on the APPEND, not just on the name read. It used to guard only the
+    # latter, so a default index past the end of `devices` was still added as a candidate — and
+    # resolve_input_device() then does `devices[idx]` and raises IndexError. Nothing catches that:
+    # the try/except there wraps query_devices() alone, MicStream.open() has no guard, and
+    # face_track's session-start thread has none either, so it would kill that thread outright and
+    # skip all SESSION_START_ATTEMPTS retries. A permanently deaf robot from one stale index.
+    #
+    # sd.default.device and sd.query_devices() normally agree, being the same PortAudio state — but
+    # refresh_devices() tears that state down and rebuilds it, which is precisely when they can
+    # disagree, so hot-plug made a latent bug reachable.
     if isinstance(default_idx, int) and 0 <= default_idx < len(devices):
         default_name = devices[default_idx].get("name", "") or ""
-    if isinstance(default_idx, int) and default_idx >= 0 and not _is_speaker_card(default_name):
-        buckets["other"].append(default_idx)
-        seen.add(default_idx)
+        if (not _is_speaker_card(default_name)
+                and not (PULSE_CAPTURE_ENABLED
+                         and default_idx in set(_pulse_candidates(devices)))):
+            buckets["other"].append(default_idx)
+            seen.add(default_idx)
+
+    # When the pulse route owns the pulse-backed entries, the raw phase must not also claim them.
+    # Two reasons, and the second is the one that bites: the raw phase probes with every source
+    # suspended, so it would read them as silent and waste the probe — and if it ever DID read one
+    # as live it would hand back kind="other" with no env, i.e. recording from pulse's default
+    # source instead of PULSE_CAPTURE_SOURCE. Same card by luck rather than on purpose, and
+    # unnamed on the dashboard. With the flag off these stay exactly what they were: the
+    # last-resort pulse-mediated fallback.
+    pulse_owned = set(_pulse_candidates(devices)) if PULSE_CAPTURE_ENABLED else set()
 
     seen_cards: set[str] = set()
     for idx, dev in enumerate(devices):
-        if dev.get("max_input_channels", 0) <= 0 or idx in seen:
+        if dev.get("max_input_channels", 0) <= 0 or idx in seen or idx in pulse_owned:
             continue
         if _is_speaker_card(dev.get("name", "")):
             _log_speaker_card_skip(idx, dev.get("name", ""))
@@ -296,8 +362,11 @@ def _candidate_input_devices(devices: list[dict]) -> list[int]:
             seen_cards.add(card)
         buckets[_classify_device(dev.get("name", ""))].append(idx)
         seen.add(idx)
-    order = {"i2s": ("i2s", "usb", "other"),
-             "usb": ("usb", "i2s", "other")}.get(_preference(), ("i2s", "usb", "other"))
+    # Preferred kind first, then the standard order for everything else — so "prefer analog" is
+    # "analog, then exactly what you would have got anyway", which is the easiest rule to predict
+    # and the easiest to state on the dashboard. "auto" is just the standard order.
+    pref = _preference()
+    order = (pref,) + tuple(k for k in _KINDS if k != pref) if pref in _KINDS else _KINDS
     return [idx for kind in order for idx in buckets[kind]]
 
 
@@ -572,6 +641,140 @@ def refresh_devices() -> bool:
               f"a mic plugged in since startup may still be invisible", flush=True)
         return False
     return True
+
+
+def _pulse_env() -> dict:
+    """The process environment a pulse-mediated capture needs, or {} if the source is unset.
+
+    PULSE_SOURCE is read by libpulse when a recording stream is created, so setting it in our own
+    environment steers OUR capture and nothing else's. Deliberately not `pactl set-default-source`,
+    which would change what every other program on the box records from — this build treats global
+    audio state as something to assert narrowly and put back (free_i2s_device / resume_pulse_sources),
+    and a default source we moved and failed to restore would be exactly that mistake."""
+    if not PULSE_CAPTURE_SOURCE or not PULSE_CAPTURE_ENV_VAR:
+        return {}
+    return {PULSE_CAPTURE_ENV_VAR: PULSE_CAPTURE_SOURCE}
+
+
+def _pulse_candidates(devices: list[dict]) -> list[int]:
+    """Input devices that are pulse-backed, in config order.
+
+    EXACT name match, not a substring: "default" occurring inside a longer device name means
+    something else entirely, and opening the wrong device here is how a "safe" route would end up
+    being the raw one."""
+    wanted = [n.lower() for n in PULSE_CAPTURE_DEVICE_NAMES if n]
+    found: list[int] = []
+    for want in wanted:                      # config order, not enumeration order
+        for idx, dev in enumerate(devices):
+            if dev.get("max_input_channels", 0) <= 0 or idx in found:
+                continue
+            if (dev.get("name", "") or "").strip().lower() == want:
+                found.append(idx)
+    return found
+
+
+def resolve_pulse_device() -> MicChoice | None:
+    """Try to capture through PulseAudio. None if disabled, unavailable, or not live.
+
+    THIS MUST BE CALLED WITH PULSE SOURCES UP. It is the whole reason resolving happens in two
+    phases: a pulse-mediated probe reads silence when the source it needs is suspended, and every
+    raw probe needs that same source suspended. See resolve_capture_device().
+
+    Why this route exists at all: the mic jack on the speaker's own dongle is on the card
+    `pactl set-card-profile` reconfigures before the first reply, and a raw capture stream there
+    segfaulted the process (2026-08-11). Pulse serialises access to the card, so there is no raw
+    device for the profile change to pull out from under us. _is_speaker_card() keeps refusing the
+    raw path and is not consulted here — that is the point of the split, not an oversight.
+
+    Asks for SAMPLE_RATE directly because pulse resamples, so MicStream skips the decimator and a
+    card that can only do 44.1 kHz — unusable raw — works fine through here.
+    """
+    if not PULSE_CAPTURE_ENABLED:
+        return None
+    try:
+        devices = sd.query_devices()
+    except Exception:
+        return None
+
+    env = _pulse_env()
+    if not env:
+        print("[mic] pulse capture is enabled but PULSE_CAPTURE_SOURCE is unset — refusing to "
+              "record from whatever pulse's default source happens to be", flush=True)
+        return None
+
+    candidates = _pulse_candidates(devices)
+    if not candidates:
+        print(f"[mic] pulse capture is enabled but no pulse-backed input device is present "
+              f"(looked for {PULSE_CAPTURE_DEVICE_NAMES}) — is pulseaudio running?", flush=True)
+        return None
+
+    # Scoped to the probe AND to the stream that follows it: MicStream.open() re-applies this from
+    # MicChoice.env before opening, so the setting does not have to survive out here.
+    previous = {k: os.environ.get(k) for k in env}
+    os.environ.update(env)
+    try:
+        for idx in candidates:
+            rate = PULSE_CAPTURE_RATE or SAMPLE_RATE
+            if _probe_is_live(idx, rate, CHANNELS, 0, ANALOG_PROBE_SILENT_RETRIES):
+                print(f"[mic] selected pulse mic: device {idx} "
+                      f"({devices[idx].get('name', '?')}) at {rate} Hz "
+                      f"via {PULSE_CAPTURE_SOURCE}", flush=True)
+                return MicChoice(idx, rate, CHANNELS, 0, "int16", False, KIND_PULSE, "", env)
+        print(f"[mic] pulse capture read as silent on {PULSE_CAPTURE_SOURCE} — falling through to "
+              f"the raw devices", flush=True)
+    finally:
+        for k, was in previous.items():
+            if was is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = was
+    return None
+
+
+def resolve_capture_device() -> MicChoice:
+    """Find a mic, running each route with the pulse state IT needs. The one entry point callers want.
+
+    Two phases, because the two routes need OPPOSITE pulse states and a single prelude can only
+    provide one:
+
+      pulse phase   pulse sources UP        — the speaker dongle's own mic jack, via pulse
+      raw phase     pulse sources SUSPENDED — the INMP441, a USB mic, a 3.5mm adapter
+
+    That is not a preference, it is physics. A raw hw open of the INMP441 needs pulse off the card or
+    it is locked to 44100 with noise injected; a pulse-mediated capture needs the source pulse holds
+    to be un-suspended or it delivers silence. Before the split, `free_i2s_device()` ran once at the
+    top and the pulse route was probed in the state guaranteed to fail it — which is why the fallback
+    that existed on paper never worked.
+
+    MIC_PREFERENCE decides which phase runs first, and both always run, so no preference can leave
+    Kai deaf. Leaves pulse suspended on the resolved device's card if and only if that device is a
+    raw hw: entry (I2S or USB alike — see `card` on MicChoice and resume_pulse_sources) so pulse
+    cannot re-grab it before MicStream opens it; every other card is handed back.
+    """
+    apply_i2s_route()
+
+    if _preference() == KIND_PULSE:
+        mic = resolve_pulse_device()          # pulse is still up: nothing has suspended it yet
+        if mic is not None:
+            return mic
+
+    free_i2s_device()
+    mic = resolve_input_device()
+    # Every card back to pulse EXCEPT the one about to be opened raw — on a build with no
+    # module-suspend-on-idle, pulse re-grabs a resumed card immediately and the open then fails
+    # with "Device unavailable". A USB mic on hw:<n>,0 is as exclusive as the I2S one, which is why
+    # this asks for the card rather than for is_i2s. See resume_pulse_sources().
+    resume_pulse_sources(keep_card=mic.card)
+    if mic.card:
+        return mic   # a raw hw device was resolved; only THEN is the pulse route probeable below
+
+    if _preference() != KIND_PULSE:
+        pulse_mic = resolve_pulse_device()
+        # Prefer a named pulse route over MicChoice(None, ...), which is "whatever the system default
+        # turns out to be" — the same card, reached by luck instead of on purpose.
+        if pulse_mic is not None and mic.device is None:
+            return pulse_mic
+    return mic
 
 
 def resolve_input_device() -> MicChoice:
