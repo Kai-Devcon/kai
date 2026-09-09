@@ -127,7 +127,7 @@ class TestStateMachine(unittest.TestCase):
     def test_start_recording_opens_i2s_stereo_and_frees_pulse(self):
         va = make_assistant()
         with patch("ai.voice_assistant.resolve_capture_device",
-                   return_value=MicChoice(3, 48000, 2, 0, "int16", True)), \
+                   return_value=MicChoice(3, 48000, 2, 0, "int16", True, "i2s", "APE")), \
              patch("ai.voice_assistant.sd.InputStream") as mock_stream_cls:
             mock_stream_cls.return_value = MagicMock()
             va.start_recording()
@@ -135,7 +135,7 @@ class TestStateMachine(unittest.TestCase):
         self.assertEqual(kwargs["channels"], 2)
         self.assertEqual(kwargs["samplerate"], 48000)
         self.assertEqual(kwargs["device"], 3)
-        # I2S capture must (re)free the card from pulse before opening the stream
+        # A raw hw device (card set) must (re)free the card from pulse before opening the stream
         self.mock_free_i2s_device.assert_called()
 
     def test_start_recording_does_not_re_free_the_card_for_a_non_i2s_mic(self):
