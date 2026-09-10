@@ -170,11 +170,18 @@ class TestSpeakerCardIsNeverCaptured(unittest.TestCase):
     def test_a_pulse_default_entry_is_kept(self):
         # "default"/"pulse" do not match the hints, and that asymmetry is the point: going through
         # pulse is the SAFE way to touch that card, because pulse coordinates access to it.
+        #
+        # Pinned to PULSE_CAPTURE_ENABLED=False: this is testing the name-hint fallback in
+        # _is_speaker_card(), not the separate "pulse owns its own entries" exclusion that applies
+        # when the route is on (see TestPulseRouteOwnsThePulseEntries) — with the route enabled, a
+        # device named exactly "default" is legitimately claimed by the pulse phase instead of the
+        # default-seed path this test exercises, which is a different guard entirely.
         devices = [
             {"name": "default", "max_input_channels": 32},
             {"name": "USB Audio Device: - (hw:0,0)", "max_input_channels": 1},
         ]
-        with patch("ai.mic_device.sd.default") as mock_default:
+        with patch("ai.mic_device.sd.default") as mock_default, \
+             patch("ai.mic_device.PULSE_CAPTURE_ENABLED", False):
             mock_default.device = [0, 0]
             candidates = _candidate_input_devices(devices)
         self.assertEqual(candidates, [0])
@@ -1206,6 +1213,38 @@ class TestPulseRouteIsReachable(PulseRouteCase):
                    {"name": "pulse", "max_input_channels": 32}]
         mic = self.run_rigged(resolve_pulse_device, live=(0, 1), devices=devices)
         self.assertEqual(mic.device, 1)
+
+    def test_the_configured_volume_is_asserted_before_the_probe(self):
+        # PULSE_CAPTURE_SOURCE_VOLUME_PCT exists because ALSA's own Mic capture ceiling was not
+        # enough on the 2026-09-10 rig — this is Kai asserting that boost itself rather than leaning
+        # on pulse's own module-stream-restore to remember a volume set by hand. It has to apply
+        # BEFORE the probe: a source too quiet to transcribe reads as too quiet to be live, too.
+        calls = []
+        with patch("ai.mic_device.subprocess.run",
+                   side_effect=lambda argv, **k: (calls.append(argv), MagicMock(stdout=""))[1]), \
+             patch("ai.mic_device.sd.query_devices", return_value=self.DEVICES), \
+             patch("ai.mic_device.sd.default", MagicMock(device=[-1, -1])), \
+             patch("ai.mic_device._probe_is_live", side_effect=lambda idx, *a, **k: idx == 2), \
+             patch("ai.mic_device.PULSE_CAPTURE_SOURCE_VOLUME_PCT", 180):
+            mic = resolve_pulse_device()
+        self.assertIsNotNone(mic)
+        volume_calls = [c for c in calls if c[:2] == ["pactl", "set-source-volume"]]
+        self.assertEqual(volume_calls,
+                         [["pactl", "set-source-volume",
+                           "alsa_input.usb-dongle.mono-fallback", "180%"]])
+
+    def test_a_none_configured_volume_leaves_pulse_alone(self):
+        # None means "leave whatever pulse already has" — most hardware needs no boost at all, and
+        # this must not turn into an unconditional 100%/unity reset for it.
+        calls = []
+        with patch("ai.mic_device.subprocess.run",
+                   side_effect=lambda argv, **k: (calls.append(argv), MagicMock(stdout=""))[1]), \
+             patch("ai.mic_device.sd.query_devices", return_value=self.DEVICES), \
+             patch("ai.mic_device.sd.default", MagicMock(device=[-1, -1])), \
+             patch("ai.mic_device._probe_is_live", side_effect=lambda idx, *a, **k: idx == 2), \
+             patch("ai.mic_device.PULSE_CAPTURE_SOURCE_VOLUME_PCT", None):
+            resolve_pulse_device()
+        self.assertFalse(any(c[:2] == ["pactl", "set-source-volume"] for c in calls))
 
 
 class TestPulseRouteOwnsThePulseEntries(PulseRouteCase):

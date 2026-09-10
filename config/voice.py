@@ -104,7 +104,7 @@ ANALOG_PROBE_SILENT_RETRIES = 1
 # ships behind a flag instead of waiting for hardware.
 #
 # OFF BY DEFAULT. A robot that works today must not change behaviour because this landed.
-PULSE_CAPTURE_ENABLED = False
+PULSE_CAPTURE_ENABLED = True
 
 # The pulse source to record from. `pactl list short sources` — it is the alsa_input.* name on the
 # same card as TTS_SINK. Set to "" to use whatever pulse's default source is, which is a worse idea
@@ -129,6 +129,26 @@ PULSE_CAPTURE_DEVICE_NAMES = ("pulse", "default")
 # That deletes the 44.1 kHz integer-ratio problem for this route rather than solving it: a card that
 # can only do 44.1 kHz is unusable raw but perfectly usable through pulse.
 PULSE_CAPTURE_RATE = SAMPLE_RATE
+
+# Software gain applied to PULSE_CAPTURE_SOURCE via `pactl set-source-volume`, as a percentage
+# (100 = unity, no boost; None = leave whatever pulse already has). ALSA's own Mic capture control
+# tops out at its hardware ceiling — on the 2026-09-10 rig (a headset run through two chained 3.5mm
+# splitters into this dongle's mic jack) that ceiling still left the signal at ~0.01 rms, an order
+# of magnitude below ASR_NORMALIZE_TARGET_RMS, because PulseAudio can amplify past unity in software
+# where ALSA cannot. 180% measured clean (no clipping) on that rig; empirically found, not derived.
+#
+# THIS IS PER-HARDWARE, NOT UNIVERSAL. It exists because that specific electret-through-two-splitters
+# path is unusually lossy — a different mic capsule, a single-splitter run, or a real standalone
+# 3.5mm mic (not simulated via a headset) will need its own number, possibly none at all, and an
+# over-applied boost here just adds clipping/noise to a route that did not need it. Re-measure with
+# scripts/mic_survey.py before changing this for different hardware; do not copy 180 forward on faith.
+#
+# Deliberately a Kai-owned, versioned setting rather than leaning on PulseAudio's own
+# module-stream-restore to remember a volume set by hand via `pactl` — that persistence is real but
+# invisible from the codebase, keyed to a device name that can drift, and gone entirely after a
+# fresh flash. Applied every time the pulse route is resolved (see resolve_pulse_device()), the same
+# "assert it, don't just hope it stuck" pattern free_i2s_device() and apply_i2s_route() already use.
+PULSE_CAPTURE_SOURCE_VOLUME_PCT = 180
 
 # Which kind of mic to probe FIRST: "auto" (i2s, then usb, then analog, then everything else),
 # "i2s", "usb", "analog", or "pulse" (the mic jack on the speaker's own dongle — needs
