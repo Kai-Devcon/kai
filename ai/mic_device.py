@@ -48,7 +48,7 @@ import settings
 from config.voice import (
     ANALOG_MIC_NAME_HINTS, ANALOG_PROBE_SILENT_RETRIES,
     PULSE_CAPTURE_DEVICE_NAMES, PULSE_CAPTURE_ENABLED, PULSE_CAPTURE_ENV_VAR, PULSE_CAPTURE_RATE,
-    PULSE_CAPTURE_SOURCE,
+    PULSE_CAPTURE_SOURCE, PULSE_CAPTURE_SOURCE_VOLUME_PCT,
     CHANNELS, FALLBACK_CAPTURE_RATES, I2S_APPLY_ROUTE_ON_STARTUP, I2S_CAPTURE_CHANNELS,
     I2S_CAPTURE_RATE, I2S_MIC_NAME_HINTS, I2S_PROBE_RETRY_DELAY_S, I2S_PROBE_SILENT_RETRIES,
     I2S_PULSE_SOURCE, I2S_ROUTE_CARD, I2S_ROUTE_CONTROLS, I2S_SUSPEND_PULSE, I2S_TAKE_CHANNEL,
@@ -493,6 +493,20 @@ def _pactl_suspend(source: str, on: bool) -> None:
               f"{'1' if on else '0'} failed ({exc})")
 
 
+def _pactl_set_source_volume(source: str, pct: int) -> None:
+    """Assert a pulseaudio source's software volume via pactl. Best-effort; raises nothing.
+
+    Idempotent and cheap to call on every resolve, matching free_i2s_device()'s "assert it every
+    time, don't just hope it stuck" pattern — module-stream-restore may well remember a volume set
+    by hand, but that is an OS-level side effect Kai does not own or version, so this makes the
+    number an explicit part of the config instead (see PULSE_CAPTURE_SOURCE_VOLUME_PCT)."""
+    try:
+        subprocess.run(["pactl", "set-source-volume", source, f"{pct}%"],
+                       check=True, capture_output=True, text=True, timeout=MIXER_TIMEOUT_S)
+    except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
+        print(f"[mic] WARNING: pactl set-source-volume {source} {pct}% failed ({exc})")
+
+
 def _pactl_source_names() -> list[str]:
     """Every pulseaudio capture source, monitors excluded. Empty if pactl/pulse is unavailable.
 
@@ -707,6 +721,12 @@ def resolve_pulse_device() -> MicChoice | None:
         print(f"[mic] pulse capture is enabled but no pulse-backed input device is present "
               f"(looked for {PULSE_CAPTURE_DEVICE_NAMES}) — is pulseaudio running?", flush=True)
         return None
+
+    # Asserted before the probe, not just before the open: a source too quiet to transcribe is also
+    # too quiet to probe as live, so the boost has to be in place for both. See
+    # PULSE_CAPTURE_SOURCE_VOLUME_PCT — this is a per-hardware number, not a universal one.
+    if PULSE_CAPTURE_SOURCE_VOLUME_PCT is not None:
+        _pactl_set_source_volume(PULSE_CAPTURE_SOURCE, PULSE_CAPTURE_SOURCE_VOLUME_PCT)
 
     # Scoped to the probe AND to the stream that follows it: MicStream.open() re-applies this from
     # MicChoice.env before opening, so the setting does not have to survive out here.
