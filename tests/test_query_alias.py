@@ -1,7 +1,8 @@
 import unittest
 
 from ai.query_alias import (
-    _skeleton, canonicalize_devcon, looks_like_devcon, match_entities, mentions_devcon,
+    _skeleton, canonicalize_devcon, expand_tagalog_question_words, looks_like_devcon,
+    match_entities, mentions_devcon,
 )
 from config.rag import DEVCON_CANONICAL
 
@@ -149,6 +150,52 @@ class TestCanonicalizeDevcon(unittest.TestCase):
     def test_real_words_left_alone(self):
         text = "the deacon has a device and a second beacon"
         self.assertEqual(canonicalize_devcon(text), text)
+
+
+class TestExpandTagalogQuestionWords(unittest.TestCase):
+    """A10: EMBED_MODEL is English-only, so a Tagalog query drifts away from the English chunk
+    that answers it — MEASURED 2026-09-17, "Sino ang nagtatag ng DEVCON?" retrieved the wrong
+    chunk entirely while the English phrasing retrieved correctly. This appends an English anchor
+    word so the embedder has something to work with, without touching what the LLM sees."""
+
+    def test_empty_returns_empty(self):
+        self.assertEqual(expand_tagalog_question_words(""), "")
+
+    def test_no_question_word_returned_unchanged(self):
+        text = "DEVCON po ba yan"
+        self.assertIs(expand_tagalog_question_words(text), text)
+
+    def test_appends_english_anchor(self):
+        self.assertEqual(expand_tagalog_question_words("Sino ang nagtatag ng DEVCON?"),
+                         "Sino ang nagtatag ng DEVCON? who founded")
+
+    def test_multi_word_translation(self):
+        self.assertEqual(expand_tagalog_question_words("Ilang taon na ang DEVCON?"),
+                         "Ilang taon na ang DEVCON? how many")
+
+    def test_case_insensitive(self):
+        self.assertEqual(expand_tagalog_question_words("SINO ang founder?"),
+                         "SINO ang founder? who")
+
+    def test_each_english_word_appended_once(self):
+        # "ilan" and "ilang" both mean "how many" — a query using both must not repeat the anchor.
+        self.assertEqual(expand_tagalog_question_words("ilan o ilang chapters?"),
+                         "ilan o ilang chapters? how many")
+
+    def test_multiple_distinct_question_words_all_appended(self):
+        self.assertEqual(expand_tagalog_question_words("sino at kailan nagtatag?"),
+                         "sino at kailan nagtatag? who when founded")
+
+    def test_original_text_preserved_exactly(self):
+        # Additive only — casing, punctuation and the Tagalog itself must survive untouched, since
+        # this is retrieval-only and never reaches the LLM or the transcript on /params.
+        text = "Sino, talaga, ang nagtatag ng DEVCON?!"
+        self.assertTrue(expand_tagalog_question_words(text).startswith(text))
+
+    def test_english_words_do_not_false_trigger(self):
+        # "who", "when" etc. are English already; nothing here should fire on an English question.
+        text = "who founded DEVCON?"
+        self.assertIs(expand_tagalog_question_words(text), text)
 
 
 if __name__ == '__main__':

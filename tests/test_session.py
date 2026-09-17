@@ -1354,6 +1354,40 @@ class TestStop(SessionCase):
         s.stop()
         s.stop()
 
+    def test_stop_signals_and_joins_a_live_warm_thread_before_it_can_synthesize_again(self):
+        # A6: a warm thread that is mid-loop (e.g. _prewarm_bank, which "runs for MINUTES by
+        # design") must not be able to see quiet during teardown and start a Piper run that
+        # outlives the process. It must be told to stop, and stop() must wait for it.
+        s = self.make()
+        started = threading.Event()
+        release = threading.Event()
+
+        def fake_warm():
+            started.set()
+            while not s._warm_stop.is_set():
+                if s._warm_stop.wait(0.01):
+                    break
+            release.set()
+
+        t = threading.Thread(target=fake_warm, daemon=True, name="kai-ack-warm")
+        s._warm_threads.append(t)
+        t.start()
+        self.assertTrue(started.wait(1.0), "the fake warm thread never started")
+
+        self.mock_prewarm_canned.reset_mock()
+        s.stop()
+
+        self.assertTrue(s._warm_stop.is_set(), "stop() must signal the warm threads")
+        self.assertTrue(release.is_set(), "stop() must not return before the warm thread unwound")
+        self.assertFalse(t.is_alive(), "stop() must join the warm thread, not just signal it")
+        self.assertEqual(s._warm_threads, [], "joined threads must not be retained")
+        self.mock_prewarm_canned.assert_not_called()
+
+    def test_quiet_for_synth_refuses_once_shutdown_is_signalled(self):
+        s = self.make()
+        s._warm_stop.set()
+        self.assertFalse(s._quiet_for_synth())
+
 
 class TestGreeting(SessionCase):
     """"Hi, I'm Kai" on boot: once per process, on the warm thread, and out of the bank's way."""

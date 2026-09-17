@@ -1,5 +1,23 @@
 # A2 — Nothing measures what Kai actually says
 
+> **Status: FIXED**, 2026-09-17. `scripts/reply_eval.py` exists, modelled on `rag_accuracy.py`,
+> calling `rag.retrieve_context` + `load_persona` + `build_chat_messages` + `_ollama_request`
+> directly (no `VoiceAssistant`, no audio). Twelve single-turn cases across all four check kinds
+> (grounded / no_invent / language / refuse), each check mechanical, `--repeats` for a pass rate
+> against gemma2:2b's sampling, `--history` for two scripted multi-turn conversations, cost stated
+> up front, cross-linked from `rag_accuracy.py`/`rag_eval.py`'s own docstrings.
+>
+> **The first real run found a live production bug before it measured anything about replies**:
+> the fastembed embedding cache was incompletely downloaded this boot, silently disabling dense RAG
+> retrieval for the robot's entire uptime today (see **A8**, fixed). The baseline below is from the
+> re-run after that fix, and after also fixing a reporting bug in this script itself (the length
+> check and the content check were folded into one pass/fail, which hid *which* one a case failed).
+>
+> **Recorded baseline, 2026-09-17, 12 cases x 3 repeats = 36 turns:** 10/36 = 28% combined pass
+> rate; both multi-turn scripts 3/3. Read past the headline number — see "What the first baseline
+> found" below, since the 28% is dominated by two *specific, since-ticketed* findings (**A9**, **A10**)
+> and one acknowledged harness limitation, not by random noise.
+
 | | |
 |---|---|
 | **Tier** | 2 |
@@ -62,12 +80,39 @@ before/after number. Three concrete consequences:
 The absence is the finding. This is not a defect in any line of code — it is the one measurement
 discipline the rest of this codebase applies everywhere and this subsystem does not.
 
+## What the first baseline found
+
+Breaking the 26/36 non-passes down by ACTUAL cause (recomputed locally against the captured
+replies, separating the length check from the content check per case — see the reporting-bug note
+above):
+
+- **7/9 non-passing "grounded"/"no_invent" runs were content-clean, correct answers that failed
+  only on LENGTH** (persona.txt's 4-sentence cap) or on the check being a **literal-phrase** match
+  against a chatty, paraphrasing persona (`"do you need internet?"` → "we run on our own power",
+  never the literal word "offline", while being straightforwardly true). This is the harness's own
+  acknowledged tension (see the ticket's "Suggested approach": "no model-as-judge" is deliberately
+  crude) and is not read as a defect in Kai — see **A9** for the length half, which reproduced
+  clearly enough (all 3/3 of one case) to ticket separately.
+- **The `language` cases are the real finding**: a Tagalog question got a majority-English (once,
+  entirely English) reply, and the Tagalog phrasing of "who founded DEVCON?" never surfaced the
+  answer that the identical English phrasing gets 3/3 — filed as **A10**.
+- **The `refuse` cases behaved close to correctly** where the reply had any specific claim to make:
+  the weather and robot-count questions got confidently invented specifics (validates **A4**
+  directly, with evidence rather than a hypothesis), while the funding/budget questions mostly
+  hedged without inventing a number — the harness's hedge-phrase list (`_HEDGE_PHRASES`,
+  `_HEDGE_TAGALOG_WORD_PAIRS`) has known gaps (e.g. "I wish I knew" isn't recognised) and is a
+  candidate for widening, not evidence of a persona regression.
+- **Both multi-turn scripts passed 3/3**: a name offered four turns earlier was recalled correctly
+  every time, and a pronoun-free follow-up ("When did it start?" after "How many chapters does
+  DEVCON have?") resolved correctly every time — good news for S12/S13's premise, from actual
+  measurement rather than a manual demo.
+
 ## Acceptance criteria
 
-- [ ] A `scripts/reply_eval.py` exists in the shape of the two RAG harnesses: read-only against the
+- [x] A `scripts/reply_eval.py` exists in the shape of the two RAG harnesses: read-only against the
       live index and a running Ollama, safe on the robot, prints a score table and a total, with the
       cases and the baseline recorded in the docstring and the instruction to keep them exact.
-- [ ] Cases are `(question, checks)` where every check is mechanical — no model-as-judge. The four
+- [x] Cases are `(question, checks)` where every check is mechanical — no model-as-judge. The four
       that matter, each derived from a failure already recorded in this repo:
       - **grounded**: a literal needle that must appear in the reply (the same needles
         `rag_accuracy` already uses, moved one stage downstream);
@@ -78,22 +123,23 @@ discipline the rest of this codebase applies everywhere and this subsystem does 
         separately — that pair is what the 96/192/160 history was about;
       - **language**: a Tagalog question gets a Tagalog reply, checked by a cheap function-word count,
         not by a model.
-- [ ] A "should refuse" set: questions whose answer is provably absent from `documents/`, where the
+- [x] A "should refuse" set: questions whose answer is provably absent from `documents/`, where the
       reply must contain a hedge and must not contain a specific-looking fact. This is the direct
       test of `NO_CONTEXT_NOTICE` and of persona.txt's "say you are not sure", neither of which is
       currently tested at all.
-- [ ] Determinism is handled honestly. gemma2:2b is sampled, so the harness runs each case N times
+- [x] Determinism is handled honestly. gemma2:2b is sampled, so the harness runs each case N times
       (N small, 3 is enough) and reports pass rate rather than pass/fail — and the docstring says so,
       so nobody reads a 1-run difference as a regression.
-- [ ] Cost is stated up front, like `rag_accuracy`'s "~20 seconds": one full turn per case per repeat
+- [x] Cost is stated up front, like `rag_accuracy`'s "~20 seconds": one full turn per case per repeat
       at ~27 tok/s, so a 30-case set at N=3 is minutes, not seconds. It is a bench tool, not a test,
       and it must not be run during a demo.
-- [ ] The harness does **not** synthesise or play audio. `filler_check.py` already owns the
+- [x] The harness does **not** synthesise or play audio. `filler_check.py` already owns the
       text→speech→text direction, and pulling Piper in here would make this unrunnable off the robot
       and would put a second synth next to a live reply — the 2026-08-07 incident.
-- [ ] A baseline is recorded on the robot, dated, before any of A4 / S13 / S14 lands.
-- [ ] `docs/README.md` (or the scripts' own listing) names it alongside the two RAG harnesses so the
-      three are discoverable as a set.
+- [x] A baseline is recorded on the robot, dated, before any of A4 / S13 / S14 lands.
+- [x] `docs/README.md` (or the scripts' own listing) names it alongside the two RAG harnesses so the
+      three are discoverable as a set. (Cross-linked from `rag_accuracy.py`'s and `rag_eval.py`'s own
+      docstrings, per that convention.)
 
 ## Suggested approach
 

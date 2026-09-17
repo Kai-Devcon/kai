@@ -12,6 +12,10 @@ Ground truth is a literal substring that must appear in the returned block. Deli
 a substring cannot drift, argue, or need a model to judge it, and if the string is absent then
 the answer was not available to the LLM no matter how the LLM behaves.
 
+A third companion, scripts/reply_eval.py, picks up one stage further downstream: does the model DO
+anything true with the block this script confirms reached it. See its docstring — the
+Micro:bit/Qwen/Google AI Suite hallucination below is exactly the gap it exists to close.
+
     python3 -m scripts.rag_accuracy           # score + the misses
     python3 -m scripts.rag_accuracy --verbose # plus the context each failing query received
 

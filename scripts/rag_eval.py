@@ -17,6 +17,11 @@ compared like for like, instead of being judged by trying two questions and call
 
 Loads the existing index read-only. Touches no settings, no servos, no Ollama, no audio. Safe to
 run on a live robot, though it will compete for CPU with the voice pipeline for ~20 seconds.
+
+Two companions cover what this script doesn't: scripts/rag_accuracy.py asks whether the retrieved
+block actually contains the answer (this script only scores the match, not the content), and
+scripts/reply_eval.py goes one stage further and asks whether the MODEL then does anything true
+with that block.
 """
 
 from __future__ import annotations

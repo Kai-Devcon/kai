@@ -48,7 +48,7 @@ from config.filler import (
     FILLER_PLAYBACK_START_BUDGET_S, FILLER_PREWARM, FILLER_STALL_GAP_JITTER_S,
 )
 from config.thinking import THINKING_SOUND_DELAY_S, THINKING_SOUND_TARGET_S, THINKING_SOUND_TEXT
-from config.voice import MIC_HOTPLUG_COOLDOWN_S, MIC_HOTPLUG_POLL_S, SAMPLE_RATE
+from config.voice import MIC_HOTPLUG_COOLDOWN_S, MIC_HOTPLUG_POLL_S, OLLAMA_NUM_CTX, SAMPLE_RATE
 from config.wake import (
     ACK_PRESYNTH, ACK_WAV_DIR, CANNED_ERROR, CANNED_NO_SPEECH,
     DEBUG_CAPTURE_DIR, DEBUG_CAPTURE_ENABLED,
@@ -108,6 +108,13 @@ REWARM_RETRY_S = 1.5         # one retry if the ack still got cancelled
 GREETING_QUIET_WAIT_S = 20.0
 GREETING_POLL_S = 0.25
 
+# stop() signals _warm_stop and then joins the warm/rewarm threads, so a Piper run started in the
+# teardown window (_prewarm_bank runs for MINUTES by design, so one of these threads is plausibly
+# awake at any given moment) cannot outlive the process the way R7's original failure did (A6,
+# 2026-09-17). Short: by the time stop() reaches the join, the threads have already been told to
+# stop and are only unwinding their current wait, not doing new work.
+WARM_JOIN_TIMEOUT_S = 2.0
+
 # How often a persistently broken presence feed may log. Reached from the 20 Hz tick and from every
 # /params snapshot, so an unthrottled line here would run at hundreds per minute — the same failure
 # NO_FACE_LOG_INTERVAL_S exists to prevent (see config/tracking.py: NO FACE was 58% of a 1.5-hour
@@ -166,6 +173,11 @@ class ConversationSession:
         self._lock = threading.RLock()
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
+        # Background TTS warm/rewarm threads (kai-ack-warm, kai-ack-rewarm) — separate from _stop
+        # because they must keep running while the SESSION is merely idle, and stop only at process
+        # shutdown. See stop() and _quiet_for_synth() (A6, 2026-09-17).
+        self._warm_stop = threading.Event()
+        self._warm_threads: list[threading.Thread] = []
 
         self.enabled = HANDS_FREE_ENABLED if enabled is None else enabled
         self._mic = mic if mic is not None else MicStream(
@@ -315,8 +327,11 @@ class ConversationSession:
         with self._lock:
             self._set_state(STATE_IDLE if self._wake_live() else STATE_DISABLED, time.monotonic())
 
+        self._warm_stop.clear()   # re-armed here so a re-entrant start() (reresolve_mic) can warm again
         if ACK_PRESYNTH or GREETING_ENABLED:
-            threading.Thread(target=self._warm_all, daemon=True, name="kai-ack-warm").start()
+            t = threading.Thread(target=self._warm_all, daemon=True, name="kai-ack-warm")
+            self._warm_threads.append(t)
+            t.start()
 
         self._stop.clear()
         self._thread = threading.Thread(target=self._tick_loop, daemon=True, name="kai-session")
@@ -328,6 +343,11 @@ class ConversationSession:
         thread, self._thread = self._thread, None
         if thread is not None:
             thread.join(timeout=2.0)
+        # Signalled BEFORE tts.stop(): _quiet_for_synth() (and every sleep in the warm/rewarm call
+        # chain) checks this and refuses to start a new Piper run once it is set, closing the window
+        # a background warm thread could otherwise use to start a run that outlives the process — the
+        # same failure R7 fixed for the reply-speaking path, reopened here (A6, 2026-09-17).
+        self._warm_stop.set()
         # After the tick thread is down (so nothing can start a new line behind us) and before the
         # mic goes: cancel any synth or playback still in flight. Every other teardown path already
         # does this — _end_session, and face_track.run()'s finally — but stop() is reachable on its
@@ -335,6 +355,13 @@ class ConversationSession:
         # ends up playing into the next. tts.stop() is a no-op when nothing is running.
         tts.stop()
         self._mic.stop()
+        warm_threads, self._warm_threads = self._warm_threads, []
+        for t in warm_threads:
+            t.join(timeout=WARM_JOIN_TIMEOUT_S)
+            if t.is_alive():
+                print(f"[session] WARNING: {t.name} did not stop within "
+                      f"{WARM_JOIN_TIMEOUT_S:.0f}s — orderly shutdown continuing without it",
+                      flush=True)
 
     def reresolve_mic(self) -> dict:
         """Re-run mic discovery and bring the capture stream back, without restarting the process.
@@ -469,10 +496,11 @@ class ConversationSession:
         are deliberate. Not before the core lines: a wake arriving during the greeting must still
         find "Yes?" on disk. Not after the bank: the bank runs for MINUTES, and a hello that arrives
         five minutes after the robot booted is not a greeting."""
-        if ACK_PRESYNTH:
+        if ACK_PRESYNTH and not self._warm_stop.is_set():
             self._prewarm_canned()
-        self._speak_greeting()
-        if ACK_PRESYNTH:
+        if not self._warm_stop.is_set():
+            self._speak_greeting()
+        if ACK_PRESYNTH and not self._warm_stop.is_set():
             self._prewarm_bank()
 
     def _speak_greeting(self) -> None:
@@ -503,13 +531,16 @@ class ConversationSession:
                   f"was not a restart you asked for, look above for a non-zero exit: this is what a "
                   f"crash-and-relaunch looks like from here.", flush=True)
             return
+        if self._warm_stop.is_set():   # shutdown raced us here — don't start a Piper run now
+            return
         _mark_greeting_spoken()
         print(f"[session] greeting: {GREETING_TEXT}", flush=True)
         self._voice.speak_text(GREETING_TEXT)
         deadline = time.monotonic() + GREETING_QUIET_WAIT_S
         while time.monotonic() < deadline and (tts.is_playing()
                                                or self._voice.speech_in_flight()):
-            time.sleep(GREETING_POLL_S)
+            if self._warm_stop.wait(GREETING_POLL_S):
+                return
 
     def _within_length_cap(self, key: str, wav) -> bool:
         """True if the synthesised line is short enough to cache. Rejected lines are never cached,
@@ -534,7 +565,13 @@ class ConversationSession:
 
         The whole reason _prewarm_bank exists. tts publishes ONE _synth_proc handle and stop() kills
         whatever is in it, so a background synth started during a turn both competes for CPU with
-        the reply's synth and makes stop() kill the wrong process."""
+        the reply's synth and makes stop() kill the wrong process.
+
+        Also False once shutdown has been signalled (_warm_stop) — the same "never start a new Piper
+        run" contract the reply-speaking path gets from tts.stop(), applied to the warm path's own
+        gating function (A6, 2026-09-17)."""
+        if self._warm_stop.is_set():
+            return False
         if tts.is_playing() or self._voice.speech_in_flight():
             return False
         with self._lock:
@@ -557,7 +594,8 @@ class ConversationSession:
         for _ in range(BANK_QUIET_WAIT_TRIES):
             if self._quiet_for_synth():
                 break
-            time.sleep(BANK_QUIET_POLL_S)
+            if self._warm_stop.wait(BANK_QUIET_POLL_S):
+                return "skip"
         else:
             return "skip"
         got = tts.prewarm_canned({key: text}, ACK_WAV_DIR)
@@ -584,8 +622,12 @@ class ConversationSession:
             return
         lines = filler.canned_lines()
         for attempt in range(BANK_PASSES):
+            if self._warm_stop.is_set():
+                return
             done = 0
             for key, text in lines.items():
+                if self._warm_stop.is_set():
+                    return
                 with self._lock:
                     if key in self._canned:
                         continue
@@ -596,8 +638,10 @@ class ConversationSession:
                 for _ in range(BANK_LINE_RETRIES + 1):
                     outcome = self._warm_one(key, text)
                     # A breath between attempts, so a long warm never monopolises the CPU the
-                    # vision loop and Ollama are also on.
-                    time.sleep(BANK_SYNTH_GAP_S)
+                    # vision loop and Ollama are also on. Also the shutdown check: this thread can
+                    # run for minutes, so it must not wait out a full breath after being told to stop.
+                    if self._warm_stop.wait(BANK_SYNTH_GAP_S):
+                        return
                     if outcome == "cached":
                         done += 1
                     if outcome != "retry":
@@ -625,7 +669,9 @@ class ConversationSession:
         """
         with self._lock:
             self._canned = {}
-        threading.Thread(target=self._rewarm_when_quiet, daemon=True, name="kai-ack-rewarm").start()
+        t = threading.Thread(target=self._rewarm_when_quiet, daemon=True, name="kai-ack-rewarm")
+        self._warm_threads.append(t)
+        t.start()
 
     def _rewarm_when_quiet(self) -> None:
         """Wait for any reply in flight, then re-synthesize — and check it actually landed.
@@ -643,18 +689,23 @@ class ConversationSession:
         """
         deadline = time.monotonic() + REWARM_QUIET_WAIT_S
         while time.monotonic() < deadline and (tts.is_playing() or self._voice.speech_in_flight()):
-            time.sleep(0.25)
+            if self._warm_stop.wait(0.25):
+                return
+        if self._warm_stop.is_set():   # shutdown raced us here — don't start a Piper run now
+            return
         self._prewarm_canned()
         with self._lock:
             missing = sorted(set(self._canned_lines()) - set(self._canned))
         if missing:
             print(f"[session] re-warm incomplete, retrying: missing {', '.join(missing)}", flush=True)
-            time.sleep(REWARM_RETRY_S)
+            if self._warm_stop.wait(REWARM_RETRY_S):
+                return
             self._prewarm_canned()
         # The bank rides the voice change too, otherwise every filler line stays in the OLD voice
         # while the four core lines retune — the same inconsistency reprewarm exists to prevent.
         # After the core retry, never before it, and paced by _prewarm_bank's own quiet checks.
-        self._prewarm_bank()
+        if not self._warm_stop.is_set():
+            self._prewarm_bank()
 
     # ── inputs ──────────────────────────────────────────────────────────────
 
@@ -1770,6 +1821,16 @@ class ConversationSession:
                 "sess_last_llm_prompt_ms": int(self._stage_ms.get("llm_prompt_ms", 0)),
                 "sess_last_llm_gen_ms": int(self._stage_ms.get("llm_gen_ms", 0)),
                 "sess_last_llm_tok_s": float(self._stage_ms.get("llm_tok_s", 0.0)),
+                # A5 backstop for the CPU/GPU placement question (A1): non-zero here is the
+                # "MODEL RELOADED" log line, visible from the dashboard instead of only
+                # /tmp/face-servo.log.
+                "sess_last_llm_load_ms": int(self._stage_ms.get("llm_load_ms", 0)),
+                # How full OLLAMA_NUM_CTX is on the last turn (A3) — measured, logged, and until now
+                # dropped before reaching anything that could act on it. Purely observational: no
+                # clamping happens here, this is just the projection onto /params.
+                "sess_last_llm_prompt_tokens": int(self._stage_ms.get("llm_prompt_tokens", 0)),
+                "sess_last_llm_gen_tokens": int(self._stage_ms.get("llm_gen_tokens", 0)),
+                "sess_llm_num_ctx": OLLAMA_NUM_CTX,
                 "sess_last_tts_synth_ms": int(self._stage_ms.get("tts_synth_ms", 0)),
                 # The number a person actually feels: end of their sentence -> first sound back.
                 "sess_last_first_audio_ms": int(self._stage_ms.get("first_audio_ms", 0)),

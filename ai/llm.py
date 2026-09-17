@@ -24,8 +24,9 @@ from pathlib import Path
 import requests
 
 from config.voice import (
-    MAX_HISTORY_TURNS, OLLAMA_KEEP_ALIVE, OLLAMA_LOG_TIMINGS, OLLAMA_MODEL, OLLAMA_NUM_CTX,
-    OLLAMA_NUM_GPU, OLLAMA_NUM_PREDICT, OLLAMA_PS_TIMEOUT_S, OLLAMA_TIMEOUT_S, OLLAMA_URL,
+    MAX_HISTORY_TURNS, OLLAMA_CTX_WARN_FRACTION, OLLAMA_KEEP_ALIVE, OLLAMA_LOG_TIMINGS,
+    OLLAMA_MODEL, OLLAMA_NUM_CTX, OLLAMA_NUM_GPU, OLLAMA_NUM_PREDICT, OLLAMA_PS_TIMEOUT_S,
+    OLLAMA_TIMEOUT_S, OLLAMA_URL,
 )
 
 # Fallback only — the real, editable persona lives in persona.txt (see load_persona()) so it
@@ -55,9 +56,44 @@ def load_persona() -> str:
     return content
 
 
-def build_chat_messages(system_prompt: str, history: list[dict], user_text: str) -> list[dict]:
-    """Pure helper: system prompt + capped rolling history + new user turn."""
+# Rough estimate, ~4 chars/token — measured close enough on persona.txt/FACTS-shaped English text
+# (see the ~1.9kB/480tok and ~2.4kB/600tok figures beside OLLAMA_NUM_CTX in config/voice.py, both
+# almost exactly 4). Not exact — the real count is Ollama's own prompt_eval_count, which only comes
+# back AFTER the request already went out — but exact isn't the job here: this only decides how much
+# history to drop BEFORE sending, and OLLAMA_CTX_WARN_FRACTION's post-hoc warning (ai/llm.py) is the
+# backstop for when this estimate runs low (A3/A7, 2026-09-17).
+_CHARS_PER_TOKEN_ESTIMATE = 4
+
+
+def _estimate_tokens(text: str) -> int:
+    """Cheap token-count estimate for text this module hasn't sent to Ollama yet. See
+    _CHARS_PER_TOKEN_ESTIMATE."""
+    return max(1, len(text) // _CHARS_PER_TOKEN_ESTIMATE)
+
+
+def build_chat_messages(system_prompt: str, history: list[dict], user_text: str,
+                         budget_tokens: int | None = None) -> list[dict]:
+    """Pure helper: system prompt + capped rolling history + new user turn.
+
+    `budget_tokens`, when given, drops the OLDEST history pairs (never the newest, and never the
+    system prompt or the new turn) beyond the MAX_HISTORY_TURNS cap until the estimated prompt fits
+    — deterministic, unlike leaving Ollama to silently truncate once OLLAMA_NUM_CTX is exceeded,
+    which is what produced "Kai forgets the opening question, confidently" (A3/A7). A robot running
+    standalone at a booth has nobody tailing the log the overflow warning prints to, so the warning
+    alone was not enough — this is the actual mitigation, and the warning stays as the signal for
+    when trimming ISN'T the fix (e.g. persona+RAG alone are already over budget with no history).
+    None (the default) disables this and keeps the MAX_HISTORY_TURNS-only cap every other caller
+    already gets."""
     capped = history[-(MAX_HISTORY_TURNS * 2):]
+    if budget_tokens is not None:
+        base = _estimate_tokens(system_prompt) + _estimate_tokens(user_text)
+        dropped = 0
+        while capped and base + sum(_estimate_tokens(m["content"]) for m in capped) > budget_tokens:
+            capped = capped[2:]   # oldest PAIR at a time — user+assistant, keeping the pairing intact
+            dropped += 1
+        if dropped:
+            print(f"[llm] trimmed {dropped} oldest history turn(s) to fit an estimated "
+                  f"~{budget_tokens}-token budget", flush=True)
     return [{"role": "system", "content": system_prompt}, *capped, {"role": "user", "content": user_text}]
 
 
@@ -70,6 +106,12 @@ def build_chat_messages(system_prompt: str, history: list[dict], user_text: str)
 #                    on CPU (see ensure_llm_warm / log_model_placement).
 #   load_duration  — non-zero means the model was evicted and reloaded, which is ~48 s on this box.
 _NS_PER_MS = 1_000_000
+
+# Edge-triggered state for the context-budget warning below (A3) — module-level because
+# _log_llm_timings is a free function called once per turn with no session object of its own, and
+# only one turn is ever in flight at a time. Same shape as the NO_FACE_LOG_INTERVAL_S precedent: a
+# conversation that stays over the threshold must not re-warn every single turn.
+_ctx_was_over = False
 
 
 def _tok_per_s(count, duration_ns) -> float:
@@ -108,6 +150,24 @@ def _log_llm_timings(data: dict, label: str = "turn") -> dict:
     if out["llm_load_ms"]:
         print(f"[llm] MODEL RELOADED: {out['llm_load_ms']}ms — placement was re-decided, "
               f"check `ollama ps` for the GPU/CPU split", flush=True)
+    # A3: how full OLLAMA_NUM_CTX is. Edge-triggered on CROSSING the threshold, not on staying over
+    # it — the NO_FACE precedent, since a per-turn warning on a long conversation is a log nobody
+    # reads. Purely observational: nothing here clamps TOP_K, history or the persona.
+    global _ctx_was_over
+    over_budget = bool(OLLAMA_NUM_CTX) and (
+        prompt_n + (OLLAMA_NUM_PREDICT or 0) > OLLAMA_CTX_WARN_FRACTION * OLLAMA_NUM_CTX)
+    if over_budget and not _ctx_was_over:
+        print(f"[llm] WARNING: prompt is {prompt_n} tok (+{OLLAMA_NUM_PREDICT or 0} reserved for "
+              f"the reply), over {OLLAMA_CTX_WARN_FRACTION:.0%} of OLLAMA_NUM_CTX ({OLLAMA_NUM_CTX}) "
+              f"— history is likely being dropped to fit", flush=True)
+    _ctx_was_over = over_budget
+    # The other budget failure, and a different fix from the one above: the reply hit the token
+    # cap and was cut mid-word rather than at a sentence end (tts.clamp_for_speech's
+    # TTS_MAX_SPOKEN_CHARS is deliberately the looser cap and normally binds first — see
+    # OLLAMA_NUM_PREDICT's comment in config/voice.py).
+    if OLLAMA_NUM_PREDICT and gen_n >= OLLAMA_NUM_PREDICT:
+        print(f"[llm] {label}: reply hit OLLAMA_NUM_PREDICT ({OLLAMA_NUM_PREDICT} tok) — "
+              f"likely cut mid-word", flush=True)
     if not OLLAMA_LOG_TIMINGS:
         return out          # the reload warning above stays regardless — it is rare and actionable
     print(f"[llm] {label}: prompt {out['llm_prompt_tokens']} tok in {out['llm_prompt_ms']}ms "

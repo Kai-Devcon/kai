@@ -32,6 +32,7 @@ from ai.wake_phrase import Token, normalize_tokens
 from config.rag import (
     DEVCON_BLOCKLIST, DEVCON_CANONICAL, DEVCON_MATCH_RATIO, DEVCON_SKELETON_CLASSES,
     DEVCON_SKELETON_DROP, DEVCON_SPELLINGS, GAZETTEER_MATCH_RATIO, GAZETTEER_MAX_TOKENS,
+    TAGALOG_QUESTION_WORDS,
 )
 
 # Length window for a single token, from len("devcon") == 6. Everything real that Whisper produces
@@ -152,6 +153,27 @@ def canonicalize_devcon(text: str) -> str:
         return text
     parts.append(text[cursor:])
     return "".join(parts)
+
+
+def expand_tagalog_question_words(text: str) -> str:
+    """Append an English translation for every Tagalog question word found in `text` — "sino ang
+    nagtatag ng DEVCON?" gains a trailing " who". Retrieval-only, additive, and idempotent-in-
+    practice: see TAGALOG_QUESTION_WORDS for why (EMBED_MODEL cannot read Tagalog at all, and the
+    question word carries most of a short query's meaning). Returns `text` unchanged when nothing
+    matches, which is the common case — most turns are English or carry no question word at all.
+    """
+    if not text:
+        return text
+    hits: list[str] = []
+    seen: set[str] = set()
+    for tok in normalize_tokens(text):
+        english = TAGALOG_QUESTION_WORDS.get(tok.text)
+        if english and english not in seen:
+            seen.add(english)
+            hits.append(english)
+    if not hits:
+        return text
+    return f"{text} {' '.join(hits)}"
 
 
 def mentions_devcon(text: str) -> bool:
