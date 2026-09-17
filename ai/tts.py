@@ -30,7 +30,7 @@ from config.voice import (
     SPEAK_SILENCE_PEAK, SPEAK_SILENCE_STEP_S,
     TTS_ENGINE, TTS_PIPER_CMD, TTS_VOICE_MODEL,
     TTS_SINK, TTS_OUTPUT_DIR, TTS_XDG_RUNTIME, TTS_LATENCY_MSEC,
-    TTS_PIPER_NORMALIZE,
+    TTS_PIPER_NORMALIZE, TTS_PIPER_TIMEOUT_S,
     TTS_POST_PROCESS, TTS_POST_SOX, TTS_POST_CHANNELS, TTS_POST_EFFECTS,
     TTS_POST_HIGHPASS, TTS_POST_ROOM,
     TTS_ASSERT_CARD_PROFILE, TTS_CARD, TTS_CARD_PROFILE, TTS_PACTL_TIMEOUT_S,
@@ -285,7 +285,17 @@ def _run_piper(text: str, dst: Path, length_scale: float | None = None) -> bool:
         print(f"[tts] WARNING: could not run Piper ({exc}) — skipping speech")
         return False
     try:
-        _, stderr = proc.communicate(input=text.encode("utf-8"))
+        _, stderr = proc.communicate(input=text.encode("utf-8"), timeout=TTS_PIPER_TIMEOUT_S)
+    except subprocess.TimeoutExpired:
+        # No caller-side deadline reaches here — the background warm/rewarm threads
+        # (ai/session.py's _warm_all/_prewarm_bank/_rewarm_when_quiet) call _run_piper with nothing
+        # watching them. Without this, a wedged Piper blocks the calling thread and leaks its child
+        # process forever (A5, 2026-09-17).
+        proc.kill()
+        proc.communicate()   # reap: drain the pipes so the killed child doesn't zombie
+        print(f"[tts] WARNING: Piper synthesis timed out after {TTS_PIPER_TIMEOUT_S}s "
+              f"— killed and skipping speech")
+        return False
     except OSError as exc:   # e.g. broken pipe if the synth died as we fed it stdin
         print(f"[tts] WARNING: Piper synthesis failed ({exc}) — skipping speech")
         return False

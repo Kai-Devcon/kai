@@ -1,5 +1,28 @@
 # A1 — Ollama re-decides the model's placement on every turn, so no KV prefix survives
 
+> **Status: INVESTIGATED, 2026-09-17.** This was an investigation ticket with a small code change
+> at the end, and the code change has landed: `ai/session.get_status()` publishes
+> `sess_last_llm_load_ms` (from the `llm_load_ms` `_stage_ms` already carried), so a reload is
+> visible on `/params` instead of only `/tmp/face-servo.log`.
+>
+> The investigation is also done, and the finding is written into `config/voice.py` beside
+> `IDENTITY_PROMPT` with the date. Summary: `/api/ps` sampled between three consecutive live turns
+> showed the runner's `expires_at`/`size_vram` completely unchanged despite `MODEL RELOADED` firing
+> on every one of them — so the reload line does not mean what it says on Ollama 0.24.0. That is
+> good news for nothing, though: `prompt_eval_count` does not shrink turn-over-turn either (868 tok,
+> then 908 tok on the next turn, growing with history) — so there is no KV prefix surviving between
+> `/api/chat` calls on this Ollama version for the reload line to have been invalidating in the
+> first place. The three prefix-preserving decisions (`RAG_CONTEXT_PLACEMENT="user"`,
+> `IDENTITY_PROMPT`'s system-slot placement, raw-transcript history) are kept as-is per the ticket's
+> own instruction — they cost nothing and become correct if `/api/chat` ever starts reusing a
+> prefix across calls. **No fix exists on this box for the underlying "no prefix reuse" behaviour**;
+> it did not require restating R6 (see the cross-ticket note below), since the destabilizing
+> half of A1's premise — placement changing mid-session — was not observed either.
+>
+> Not done: a plain (non-RAG) chat turn's prompt-token count was not captured (a `/voice/wake`
+> follow-up was rejected by the session's own idle-state gate, unrelated to this ticket), and the
+> before/after `first_audio_ms` comparison does not apply since no fix landed to compare against.
+
 | | |
 |---|---|
 | **Tier** | 2 |
@@ -66,31 +89,33 @@ explain it.
 
 ## Acceptance criteria
 
-- [ ] The measurement is reproduced from a current log: how many consecutive turns carry a non-zero
+- [x] The measurement is reproduced from a current log: how many consecutive turns carry a non-zero
       `load_duration`, and the distribution of the value. One captured session is enough; record the
       date and the Ollama version.
-- [ ] It is established whether this is a genuine runner reload or Ollama reporting a non-zero
+- [x] It is established whether this is a genuine runner reload or Ollama reporting a non-zero
       `load_duration` for an already-resident runner. `GET /api/ps` sampled between consecutive turns
       is the discriminator — a changing `expires_at`, or a `size_vram` that moves, means a real
       reload; a stable entry across a reload-reporting turn means the field is being misread.
-- [ ] `prompt_eval_count` / `prompt_eval_duration` are read across a short conversation with a fixed
+- [x] `prompt_eval_count` / `prompt_eval_duration` are read across a short conversation with a fixed
       persona. If a prefix is surviving, the second and later turns evaluate materially fewer prompt
       tokens than the first; if every turn evaluates the whole prompt, the prefix is gone. This is
       the direct test and it needs no Ollama internals.
-- [ ] `llm_load_ms` is published on `/params` as `sess_last_llm_load_ms`, so a reload is visible from
+- [x] `llm_load_ms` is published on `/params` as `sess_last_llm_load_ms`, so a reload is visible from
       the dashboard rather than only from `/tmp/face-servo.log`. It is already measured in
       `_stage_ms`; only the projection in `ai/session.get_status()` is missing.
-- [ ] The finding is written into `config/voice.py` beside `OLLAMA_KEEP_ALIVE`, with the date, in the
+- [x] The finding is written into `config/voice.py` beside `OLLAMA_KEEP_ALIVE`, with the date, in the
       same comment-as-measurement style as its neighbours — including the negative result if it turns
-      out the field was being misread.
+      out the field was being misread. (Landed beside `IDENTITY_PROMPT`, which is the comment that
+      was actually deferring on this measurement — see the criterion below.)
 - [ ] If the reload is real and has a fix (a `keep_alive` form the installed Ollama honours, a
       service-level setting, a version), it lands and the before/after `first_audio_ms` medians are
-      recorded.
-- [ ] If it is real and has **no** fix on this box, the three prefix-preserving decisions above get a
+      recorded. **N/A** — the reload is not real (see above); nothing to fix here.
+- [x] If it is real and has **no** fix on this box, the three prefix-preserving decisions above get a
       one-line note saying so, so a future reader does not re-derive an optimisation that is not
       running. Do not remove them: they cost nothing, and they become correct again the moment the
-      reload stops.
-- [ ] `IDENTITY_PROMPT`'s comment is updated either way — it explicitly defers its own "one
+      reload stops. (The deeper finding is that there is no prefix regardless of the reload line —
+      noted as such.)
+- [x] `IDENTITY_PROMPT`'s comment is updated either way — it explicitly defers its own "one
       invalidation" claim until this is resolved, and that deferral is what this ticket closes.
 
 ## Suggested approach

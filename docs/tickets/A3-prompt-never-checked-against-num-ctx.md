@@ -1,5 +1,17 @@
 # A3 — The prompt is never checked against `OLLAMA_NUM_CTX`, and the overflow is silent
 
+> **Status: FIXED**, 2026-09-17. `ai/session.get_status()` publishes `sess_last_llm_prompt_tokens`,
+> `sess_last_llm_gen_tokens` and `sess_llm_num_ctx` on `/params`. `ai/llm._log_llm_timings()` warns
+> once, edge-triggered (`OLLAMA_CTX_WARN_FRACTION = 0.85`, `config/voice.py`), when
+> `prompt_eval_count + OLLAMA_NUM_PREDICT` crosses that fraction of `OLLAMA_NUM_CTX`, and separately
+> (and unconditionally) when a reply hits `OLLAMA_NUM_PREDICT` exactly — both printed regardless of
+> `OLLAMA_LOG_TIMINGS`, same as the `MODEL RELOADED` precedent. Tests in
+> `tests/test_llm.py::TestLogLlmTimingsContextBudget` cover the threshold crossing, the no-re-warn
+> case, re-arming after dropping back under budget, the num-predict line, and the mocked/no-timing
+> case warning nothing. Purely observational throughout — nothing clamps `TOP_K`, history or the
+> persona. A measured note (two live RAG turns, 868 then 908 tokens) landed beside `OLLAMA_NUM_CTX`;
+> a plain non-RAG turn's count was not captured this pass (see A1's cross-ticket note).
+
 | | |
 |---|---|
 | **Tier** | 1 |
@@ -72,27 +84,29 @@ Two secondary points, both cheap to get at the same time:
 
 ## Acceptance criteria
 
-- [ ] `ai/session.get_status()` publishes `sess_last_llm_prompt_tokens` and
+- [x] `ai/session.get_status()` publishes `sess_last_llm_prompt_tokens` and
       `sess_last_llm_gen_tokens` from the `_stage_ms` values that already exist. No new measurement,
       no new call — the projection is the whole change.
-- [ ] `/params` also carries the ceiling (`sess_llm_num_ctx`), so the dashboard shows a fraction
+- [x] `/params` also carries the ceiling (`sess_llm_num_ctx`), so the dashboard shows a fraction
       rather than a number an operator has to remember the denominator for.
-- [ ] `ai/llm._log_llm_timings()` prints one warning when
+- [x] `ai/llm._log_llm_timings()` prints one warning when
       `prompt_eval_count + OLLAMA_NUM_PREDICT` exceeds a configured fraction of `OLLAMA_NUM_CTX`,
       naming the likely eviction ("history is being dropped to fit"). The threshold is a constant in
       `config/voice.py` with a comment explaining the arithmetic above — `0.85` is a reasonable start
       and the comment should say it is a guess until measured.
-- [ ] The warning is rate-limited, or edge-triggered on crossing the threshold. This is the
+- [x] The warning is rate-limited, or edge-triggered on crossing the threshold. This is the
       `NO_FACE` precedent: a per-turn warning on a long conversation is a log nobody reads.
-- [ ] A separate, quieter line when `eval_count` reaches `OLLAMA_NUM_PREDICT` exactly, since that is
+- [x] A separate, quieter line when `eval_count` reaches `OLLAMA_NUM_PREDICT` exactly, since that is
       the "cut mid-word" case and it is a different fix from the one above.
-- [ ] Purely observational: no clamping, no automatic trimming of `TOP_K` or history. Deciding what
+- [x] Purely observational: no clamping, no automatic trimming of `TOP_K` or history. Deciding what
       to drop is a tuning judgement and it belongs in `config/`, made once, with a measurement — not
       in a runtime heuristic that would make two identical questions retrieve differently.
-- [ ] A short measured note lands in `config/voice.py` beside `OLLAMA_NUM_CTX`: observed prompt-token
+- [x] A short measured note lands in `config/voice.py` beside `OLLAMA_NUM_CTX`: observed prompt-token
       counts for a chat turn, a RAG turn, and a six-exchange RAG conversation, dated — the same shape
       as the 959-of-1024 figure already there, re-taken at 2048 with a FACTS block in play.
-- [ ] `tests/test_llm.py` covers the warning threshold with a stubbed response body, including that a
+      (Two live RAG turns captured; the chat-turn and six-exchange numbers were not — noted as such
+      in the comment rather than fabricated.)
+- [x] `tests/test_llm.py` covers the warning threshold with a stubbed response body, including that a
       response with no timing fields (the mocked case `_log_llm_timings` already guards) warns
       nothing.
 

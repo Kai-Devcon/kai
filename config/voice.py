@@ -468,6 +468,32 @@ OLLAMA_KEEP_ALIVE = -1     # must be a JSON number, not a string — Ollama trea
 # before changing this line or the model.
 OLLAMA_NUM_CTX   = 2048
 
+# MEASURED 2026-09-17, re-taken at this 2048 ceiling with a real FACTS block in play
+# (docs/tickets/A3), on `/voice/wake` turns against the live robot:
+#   two consecutive RAG turns (TOP_K=3 FACTS block on each): 868 tok, then 908 tok with the first
+#   exchange now in history — already 42-44% of 2048 after just two turns. A six-exchange RAG
+#   conversation was not re-driven live this pass, but the growth rate here (~40 tok/exchange on
+#   top of the ~600 tok FACTS block each turn) crosses OLLAMA_CTX_WARN_FRACTION's 0.85 well before
+#   MAX_HISTORY_TURNS = 6 is reached, consistent with the 959-of-1024 (94%) figure this replaces.
+#   A plain (non-RAG) chat turn was not captured this pass — /voice/wake rejected the follow-up
+#   request ("wake rejected while idle"), a session-state gate unrelated to this measurement.
+
+# A3: the eviction above used to be SILENT — nothing compared prompt_eval_count to OLLAMA_NUM_CTX
+# before 2026-09-17, so it looked like the model, not the system, when a long RAG conversation
+# crowded the window (persona.txt ~480 tok + a ~600 tok FACTS block at
+# TOP_K=3/CHUNK_SIZE_CHARS=800 + rolling history + OLLAMA_NUM_PREDICT's 160-token reservation all
+# compete for this budget — see docs/tickets/A3-prompt-never-checked-against-num-ctx.md for the
+# arithmetic). As of A7 (2026-09-17), ai/llm.build_chat_messages() now TRIMS the oldest history
+# pairs first, deterministically, to fit OLLAMA_NUM_CTX - OLLAMA_NUM_PREDICT before a request goes
+# out — a robot running standalone at a booth has nobody tailing the log this warning prints to, so
+# a warning alone was judged not enough (see A7). This fraction now names the WARNING threshold
+# only: _log_llm_timings() still warns once when prompt_eval_count + OLLAMA_NUM_PREDICT crosses it,
+# as the signal for when trimming ISN'T the fix — e.g. persona+RAG alone are already over budget
+# with no history left to drop, which is a TOP_K/CHUNK_SIZE/persona-length problem, not a history
+# one. 0.85 is a GUESS until measured; the 959-of-1024 (94%) figure above was taken at the old
+# ceiling.
+OLLAMA_CTX_WARN_FRACTION = 0.85
+
 # GPU layers for Ollama. None = let Ollama auto-decide the GPU/CPU split (fast — gemma2:2b fits
 # the GPU alongside the camera on a freshly-booted/defragmented Jetson). 0 = force CPU (reliable
 # but too slow for conversation). A positive int forces that many layers on GPU.
@@ -536,15 +562,29 @@ IDENTITY_CAPTURE = True
 # string does NOT change once learned, so in principle it costs one prefix invalidation at the
 # moment the name is captured and nothing afterwards.
 #
-# MEASURED 2026-08-10, and the "one invalidation" half is NOT confirmed — it is currently
-# unmeasurable on this robot. Every `[llm] turn:` line in /tmp/face-servo.log is preceded by
-# `MODEL RELOADED: ~200-360ms — placement was re-decided`, on every turn, so there is no surviving
-# KV prefix between turns for anything to invalidate. What WAS measured is that the injection costs
-# nothing detectable: turns with a name pinned evaluated their prompt in 258-304 ms
-# (2654-3394 tok/s), inside the spread of turns without one (215-465 ms).
-# Re-measure if the per-turn reload is ever fixed — that is the point at which the prefix reasoning
-# starts to mean something. If prompt_eval_* then spikes every turn rather than once, the string is
-# being rebuilt and this placement is wrong.
+# MEASURED 2026-08-10, RE-MEASURED 2026-09-17 (Ollama 0.24.0, docs/tickets/A1) — the "one
+# invalidation" half is now CONFIRMED NOT TO APPLY, and the reason turned out to be one level
+# deeper than "the reload never stops": there is no KV prefix surviving between turns AT ALL for it
+# to apply to, on this Ollama version, regardless of what the reload log line means.
+#
+# `MODEL RELOADED: ~200-560ms` still fires on every single turn. But sampling `/api/ps` between
+# three consecutive live turns on 2026-09-17 found its `expires_at` (pinned far in the future by
+# OLLAMA_KEEP_ALIVE=-1) and `size_vram` BOTH unchanged across every one of them — so no placement
+# decision was actually being re-made. The field is being misread in the sense the log line implies
+# ("placement was re-decided"): Ollama 0.24.0 appears to report a small nonzero load_duration on
+# essentially every /api/chat call regardless of residency, not only on a genuine reload.
+#
+# That would be good news for the prefix reasoning, except: prompt_eval_count does NOT shrink
+# turn-over-turn either. Two consecutive RAG turns in that same sample evaluated 868 then 908
+# tokens — GROWING with the added history, not shrinking the way a reused prefix would show. So
+# Ollama's /api/chat is not reusing a cached prefix across separate calls on this version, and the
+# per-turn reload line was never the mechanism preventing it — there was nothing here to invalidate
+# either way. RAG_CONTEXT_PLACEMENT="user", this placement, and _call_ollama's raw-transcript
+# history currently buy NOTHING measurable. Keep them anyway: they cost nothing, and they become
+# correct the moment /api/chat (or an Ollama upgrade) starts reusing a prefix across calls.
+# Re-measure if that ever changes — the signal is prompt_eval_count shrinking after the first turn
+# of a fixed-persona conversation, not the reload line, which this measurement showed is not
+# trustworthy on this version.
 #
 # The "not in every reply" clause is load-bearing. Without it the model opens more or less every
 # sentence with the name, which reads worse than never using it at all.
@@ -804,6 +844,18 @@ TTS_CARD_PROFILE = "output:analog-stereo+input:mono-fallback"
 # Ceiling on the pactl call above, for the same reason MIXER_TIMEOUT_S exists in config/wake.py: an
 # unresponsive pulseaudio must not be able to wedge the speak worker thread indefinitely.
 TTS_PACTL_TIMEOUT_S = 5.0
+
+# Ceiling on _run_piper's communicate(). A live turn is already bounded from outside by
+# SESSION_SPEAK_MAX_UNKNOWN_S (20 s, config/wake.py) via tts.stop() — but the background warm/rewarm
+# threads (ai/session.py's _warm_all/_prewarm_bank/_rewarm_when_quiet) call _run_piper with nothing
+# watching them, so a wedged Piper there (GIL contention under config/tracking.py's documented
+# bottleneck, a corrupted model/espeak-ng read, or memory pressure at the edge of the 2.0-2.3 GB
+# headroom docs/memory-budget.md measures) blocked the calling thread forever — one leaked OS thread
+# and one leaked Piper child for the life of the process (A5, 2026-09-17).
+# Sized well above the longest synth observed (~3.4-3.7 s per long line, see TTS_SENTENCE_SILENCE_S's
+# measurement note above) with generous margin for Jetson CPU contention, and comfortably under the
+# 20 s outer deadline so a genuine hang is caught here rather than by the coarser backstop.
+TTS_PIPER_TIMEOUT_S = 15.0
 
 # ── Delivery shaping (ai/delivery.py) ───────────────────────────────────────────
 # Applied to the SPOKEN text only, on the way to Piper. Read ai/delivery.py's module docstring

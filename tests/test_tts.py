@@ -433,6 +433,23 @@ class TestRunPiper(_ResetProcState):
             self.assertFalse(tts._run_piper("hi", Path("/tmp/x.wav")))
         mock_popen.assert_not_called()
 
+    def test_hung_piper_is_killed_and_reaped_within_the_call(self):
+        # A5: nothing watches the background warm/rewarm threads' calls to _run_piper, so a wedged
+        # Piper must be bounded HERE rather than relying on a caller-side deadline — otherwise the
+        # calling thread (and its Popen child) is leaked for the life of the process.
+        proc = _fake_proc(alive=True)
+        proc.communicate.side_effect = [
+            subprocess.TimeoutExpired(cmd="piper", timeout=tts.TTS_PIPER_TIMEOUT_S),
+            (b"", b""),   # the reap call after kill()
+        ]
+        with patch("ai.tts.voice_model_path", return_value=Path(__file__)), \
+             patch("subprocess.Popen", return_value=proc), \
+             patch("builtins.print") as mock_print:
+            self.assertFalse(tts._run_piper("hi", Path("/tmp/x.wav")))
+        proc.kill.assert_called_once()
+        mock_print.assert_called_once()
+        self.assertIsNone(tts._synth_proc, "handle must be cleared after a timeout")
+
 
 class TestSynthesizeTo(_ResetProcState):
     def test_returns_none_for_unspeakable_text(self):

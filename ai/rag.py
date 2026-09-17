@@ -62,7 +62,9 @@ def chunk_label(chunk: dict) -> str:
 
 # Fuzzy brand-name folding on the query side (see retrieve_context). Pure stdlib — importing it
 # here does not pull the audio/whisper stack in, only wake_phrase.py's tokenizer.
-from ai.query_alias import canonicalize_devcon, match_entities, mentions_devcon
+from ai.query_alias import (
+    canonicalize_devcon, expand_tagalog_question_words, match_entities, mentions_devcon,
+)
 from ai.wake_phrase import normalize_tokens
 
 _embed_model = None
@@ -424,10 +426,12 @@ def points_backwards(text: str) -> bool:
 def _build_query(query_text: str, previous_user_text: str | None) -> tuple[str, bool]:
     """The embedded query, and whether this turn is provably about DEVCON.
 
-    Three rewrites, all retrieval-only. canonicalize_devcon() folds whatever Whisper made of the
-    brand onto the documents' spelling. match_entities() does the same for program and chapter
-    names, and appends the canonical form — a mangled "campus dev con" is not repaired by the
-    brand matcher alone. Anaphora expansion prepends the previous turn when this one leans on it.
+    Four rewrites, all retrieval-only. canonicalize_devcon() folds whatever Whisper made of the
+    brand onto the documents' spelling. expand_tagalog_question_words() appends an English anchor
+    for EMBED_MODEL, which cannot read Tagalog at all (A10). match_entities() does the same for
+    program and chapter names, and appends the canonical form — a mangled "campus dev con" is not
+    repaired by the brand matcher alone. Anaphora expansion prepends the previous turn when this
+    one leans on it.
 
     The flag is the gate for the whole failsafe chain below, so it is set only by evidence in the
     text: the brand, or a name that exists nowhere but these documents."""
@@ -435,6 +439,11 @@ def _build_query(query_text: str, previous_user_text: str | None) -> tuple[str, 
     if query != query_text:
         print(f"[rag] query canonicalized for retrieval: {query_text!r} -> {query!r}")
     brand = mentions_devcon(query)
+
+    expanded = expand_tagalog_question_words(query)
+    if expanded != query:
+        print(f"[rag] Tagalog question word expanded for retrieval: {query!r} -> {expanded!r}")
+        query = expanded
 
     entities = match_entities(query, _INDEX_ENTITIES)
     if entities:

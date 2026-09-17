@@ -235,6 +235,35 @@ ANAPHORA_WORDS = frozenset({
     "sila", "siya", "nila", "niya", "kanila", "kanya", "ito", "iyan", "yan", "iyon", "yun",
 })
 
+# ── Tagalog question words, translated for retrieval only (A10) ────────────────────────────────
+# EMBED_MODEL is English-only (bge-small-en-v1.5). A Tagalog query still carries "DEVCON" and any
+# English loanwords, but the QUESTION WORD carries most of a short query's meaning ("sino" vs
+# "kailan" is the difference between asking for a person and a date) and the embedder cannot read
+# it at all. MEASURED 2026-09-17: "Sino ang nagtatag ng DEVCON?" (who founded DEVCON?) retrieved
+# the wrong chunk entirely (a "where can I find DEVCON online" entry) while the identical English
+# phrasing retrieved the correct one (Winston Damarillo) — same for "Ilang taon na ang DEVCON?"
+# against "when did DEVCON start?" (2009). See docs/tickets/A10.
+#
+# Appended to the query before embedding, never substituted — same "retrieval-only, query
+# untouched for the LLM" contract canonicalize_devcon() and match_entities() already keep. A short
+# list, not a translator: this is meant to give the embedder a few extra English anchor words, not
+# to translate the query.
+#
+# The question words alone were NOT enough: "Sino ang nagtatag ng DEVCON?" + "who" still retrieved
+# the wrong chunk (measured 2026-09-17) — a bare "who" is too generic to out-rank the wrong entry
+# ("Where can I find DEVCON online?"). The CONTENT word carries the actual meaning ("nagtatag" =
+# founded) and is what the target document's own Q&A phrasing ("DEVCON's founder and president is
+# Winston Damarillo") shares. A handful of the highest-traffic content words from documents/'s own
+# FAQ phrasing are included below for the same reason — add more here, not a general dictionary,
+# if a specific question is still missing its answer.
+TAGALOG_QUESTION_WORDS = {
+    "sino": "who", "ano": "what", "anong": "what", "kailan": "when", "saan": "where",
+    "paano": "how", "bakit": "why", "ilan": "how many", "ilang": "how many",
+    "magkano": "how much", "gaano": "how",
+    "nagtatag": "founded", "itinatag": "founded", "tagapagtatag": "founder",
+    "namumuno": "leads leader", "pinuno": "leader", "pangulo": "president",
+}
+
 # Per-source score bonus, added to cosine similarity before ranking (ai/rag.py rank_chunks).
 # Not a general relevance dial — it exists because documents/ is ~70% one large DEVCON brand and
 # content style guide, and its chunks crowd out Kai's own five-line fact sheet on exactly the

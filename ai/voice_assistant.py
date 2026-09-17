@@ -61,7 +61,7 @@ from config.voice import (
     WHISPER_MODEL, WHISPER_DEVICE, WHISPER_COMPUTE, WHISPER_LANGUAGE, WHISPER_LANGUAGES,
     WHISPER_CPU_THREADS, WHISPER_BEAM_SIZE, WHISPER_INITIAL_PROMPT,
     ASR_NORMALIZE, ASR_NORMALIZE_MAX_GAIN, ASR_NORMALIZE_SCAN,
-    RAG_CONTEXT_PLACEMENT, MAX_HISTORY_TURNS,
+    RAG_CONTEXT_PLACEMENT, MAX_HISTORY_TURNS, OLLAMA_NUM_CTX, OLLAMA_NUM_PREDICT,
     IDENTITY_CAPTURE, IDENTITY_PROMPT,
     SPEAK_TRIM_SILENCE, TTS_PLAYBACK_LEAD_S,
 )
@@ -1080,7 +1080,12 @@ class VoiceAssistant:
         else:
             system_prompt, user_content = persona, text
 
-        messages = build_chat_messages(system_prompt, history, user_content)
+        # A3/A7: trim the OLDEST history first, deterministically, rather than let a long RAG
+        # conversation overflow OLLAMA_NUM_CTX and leave Ollama to truncate it silently — which
+        # is what produced the "Kai forgets the opening question" failure in the first place.
+        # Reserve OLLAMA_NUM_PREDICT so the trim targets the space actually left for the prompt.
+        budget = OLLAMA_NUM_CTX - (OLLAMA_NUM_PREDICT or 0)
+        messages = build_chat_messages(system_prompt, history, user_content, budget_tokens=budget)
         llm_t0 = time.monotonic()
         data = _ollama_request(messages)
         llm_ms = int((time.monotonic() - llm_t0) * 1000)
